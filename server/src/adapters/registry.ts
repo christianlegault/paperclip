@@ -42,6 +42,17 @@ import {
   models as codexModels,
 } from "@paperclipai/adapter-codex-local";
 import {
+  execute as copilotExecute,
+  listCopilotSkills,
+  syncCopilotSkills,
+  testEnvironment as copilotTestEnvironment,
+  sessionCodec as copilotSessionCodec,
+} from "@paperclipai/adapter-copilot-local/server";
+import {
+  agentConfigurationDoc as copilotAgentConfigurationDoc,
+  models as copilotModels,
+} from "@paperclipai/adapter-copilot-local";
+import {
   execute as cursorExecute,
   listCursorSkills,
   syncCursorSkills,
@@ -175,6 +186,15 @@ function buildNpmRuntimeCommandSpec(
 
 function buildCursorRuntimeCommandSpec(config: Record<string, unknown>): AdapterRuntimeCommandSpec {
   const command = readConfiguredCommand(config, "agent");
+  return {
+    command,
+    detectCommand: command,
+    installCommand: null,
+  };
+}
+
+function buildCopilotRuntimeCommandSpec(config: Record<string, unknown>): AdapterRuntimeCommandSpec {
+  const command = readConfiguredCommand(config, "copilot");
   return {
     command,
     detectCommand: command,
@@ -701,6 +721,25 @@ const cursorLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: cursorAgentConfigurationDoc,
 };
 
+const copilotLocalAdapter: ServerAdapterModule = {
+  type: "copilot_local",
+  runtimeToolDelivery: "environment",
+  execute: copilotExecute,
+  testEnvironment: copilotTestEnvironment,
+  listSkills: listCopilotSkills,
+  syncSkills: syncCopilotSkills,
+  sessionCodec: copilotSessionCodec,
+  sessionManagement: getAdapterSessionManagement("copilot_local") ?? undefined,
+  supportsToolRefreshOnResume: true,
+  models: copilotModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  getRuntimeCommandSpec: buildCopilotRuntimeCommandSpec,
+  agentConfigurationDoc: copilotAgentConfigurationDoc,
+};
+
 const cursorCloudAdapter: ServerAdapterModule = {
   type: "cursor_cloud",
   runtimeToolDelivery: "invocation_context",
@@ -882,6 +921,7 @@ function registerBuiltInAdapters() {
     piLocalAdapter,
     cursorCloudAdapter,
     cursorLocalAdapter,
+    copilotLocalAdapter,
     geminiLocalAdapter,
     grokLocalAdapter,
     kimiLocalAdapter,

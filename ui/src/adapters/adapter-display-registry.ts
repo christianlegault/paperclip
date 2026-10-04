@@ -12,6 +12,7 @@ import {
   Gem,
   Moon,
   MousePointer2,
+  Plane,
   Sparkles,
   Terminal,
   Cpu,
@@ -79,6 +80,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Codex CLI harness",
     icon: Code,
     recommended: true,
+  },
+  copilot_local: {
+    label: "GitHub Copilot",
+    description: "GitHub Copilot CLI harness",
+    icon: Plane,
   },
   paperclip_runner: {
     label: "Paperclip Runner",

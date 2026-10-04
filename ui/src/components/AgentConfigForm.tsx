@@ -33,6 +33,7 @@ import {
 } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
+import { DEFAULT_COPILOT_LOCAL_MODEL } from "@paperclipai/adapter-copilot-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -297,6 +298,14 @@ const claudeThinkingEffortOptions = [
 
 // Kimi exposes low/high/max (no "medium") via each model's support_efforts;
 // the kimi_local adapter maps a legacy "medium" onto "high" at runtime.
+const copilotThinkingEffortOptions = [
+  { id: "", label: "Auto" },
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "X-High" },
+] as const;
+
 const kimiThinkingEffortOptions = [
   { id: "", label: "Auto" },
   { id: "low", label: "Low" },
@@ -1284,6 +1293,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           ? openCodeThinkingEffortOptions
           : adapterType === "kimi_local"
             ? kimiThinkingEffortOptions
+            : adapterType === "copilot_local"
+              ? copilotThinkingEffortOptions
             : adapterType === "pi_local"
               ? [{ id: "", label: "Auto" }, ...["off", "minimal", "low", "medium", "high", "xhigh"].map(id => ({ id, label: id }))]
               : adapterType === "claude_local" || adapterType === "grok_local"
@@ -1611,6 +1622,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                       nextValues.model = DEFAULT_KIMI_LOCAL_MODEL;
                     } else if (t === "cursor") {
                       nextValues.model = DEFAULT_CURSOR_LOCAL_MODEL;
+                    } else if (t === "copilot_local") {
+                      nextValues.model = DEFAULT_COPILOT_LOCAL_MODEL;
                     } else if (t === "opencode_local") {
                       nextValues.model = DEFAULT_OPENCODE_LOCAL_MODEL;
                     } else if (t === "paperclip_runner") {
@@ -1633,6 +1646,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                               ? DEFAULT_OPENCODE_LOCAL_MODEL
                             : t === "cursor"
                               ? DEFAULT_CURSOR_LOCAL_MODEL
+                            : t === "copilot_local"
+                              ? DEFAULT_COPILOT_LOCAL_MODEL
                             : t === "paperclip_runner"
                               ? resolvePaperclipRunnerTransitionModel(adapterType, config.model)
                               : "",
@@ -1888,6 +1903,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                         kimi_local: "kimi",
                         pi_local: "pi",
                         cursor: "agent",
+                        copilot_local: "copilot",
                         opencode_local: "opencode",
                       } as Record<string, string>)[adapterType] ?? adapterType.replace(/_local$/, "")
                     }

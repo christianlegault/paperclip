@@ -106,6 +106,7 @@ import {
 import { buildNewAgentRuntimeConfig } from "../lib/new-agent-runtime-config";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
+import { DEFAULT_COPILOT_LOCAL_MODEL } from "@paperclipai/adapter-copilot-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL, isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
@@ -1129,7 +1130,8 @@ function OnboardingWizardInner({
     adapterType === "kimi_local" ||
     adapterType === "opencode_local" ||
     adapterType === "pi_local" ||
-    adapterType === "cursor";
+    adapterType === "cursor" ||
+    adapterType === "copilot_local";
   // Build adapter grids dynamically from the UI registry + display metadata.
   // External/plugin adapters automatically appear with generic defaults, and
   // server-disabled types are filtered out.
@@ -1509,6 +1511,10 @@ function OnboardingWizardInner({
       setModel(DEFAULT_CURSOR_LOCAL_MODEL);
       return;
     }
+    if (next === "copilot_local") {
+      setModel(DEFAULT_COPILOT_LOCAL_MODEL);
+      return;
+    }
     setModel("");
   }, [adapterRegistryLoaded, recommendedAdapters, moreAdapters, adapterType]);
 
@@ -1519,6 +1525,7 @@ function OnboardingWizardInner({
     kimi_local: "kimi",
     pi_local: "pi",
     cursor: "agent",
+    copilot_local: "copilot",
     opencode_local: "opencode",
   };
   const effectiveAdapterCommand =
@@ -1827,6 +1834,8 @@ function OnboardingWizardInner({
             ? model || DEFAULT_KIMI_LOCAL_MODEL
           : adapterType === "cursor"
             ? model || DEFAULT_CURSOR_LOCAL_MODEL
+          : adapterType === "copilot_local"
+            ? model || DEFAULT_COPILOT_LOCAL_MODEL
             : adapterType === "opencode_local"
               ? model || DEFAULT_OPENCODE_LOCAL_MODEL
               : model,
@@ -2976,6 +2985,8 @@ function OnboardingWizardInner({
                           <p className="text-muted-foreground font-mono break-all">
                             {adapterType === "cursor"
                               ? `${effectiveAdapterCommand} -p --mode ask --output-format json \"Respond with hello.\"`
+                              : adapterType === "copilot_local"
+                              ? `${effectiveAdapterCommand} --output-format json --allow-all-tools --no-ask-user -p "Respond with hello."`
                               : adapterType === "codex_local"
                               ? `${effectiveAdapterCommand} exec --json -`
                               : adapterType === "gemini_local"
@@ -2990,7 +3001,15 @@ function OnboardingWizardInner({
                             Prompt:{" "}
                             <span className="font-mono">Respond with hello.</span>
                           </p>
-                          {adapterType === "cursor" ||
+                          {adapterType === "copilot_local" ? (
+                            <p className="text-muted-foreground">
+                              If auth fails, run{" "}
+                              <span className="font-mono">copilot login</span>{" "}
+                              or set{" "}
+                              <span className="font-mono">COPILOT_GITHUB_TOKEN</span>{" "}
+                              in env, then retry.
+                            </p>
+                          ) : adapterType === "cursor" ||
                           adapterType === "codex_local" ||
                           adapterType === "gemini_local" ||
                           adapterType === "kimi_local" ||

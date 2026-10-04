@@ -889,6 +889,7 @@ const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
   "codex_local",
+  "copilot_local",
   "cursor",
   "gemini_local",
   "grok_local",
@@ -1274,6 +1275,7 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
+  "copilot_local",
   "cursor",
   "gemini_local",
   "hermes_local",
