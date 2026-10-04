@@ -252,6 +252,8 @@ const MODEL_SOURCE_INLINE_MARKS: Record<string, ComponentType<{ className?: stri
 const API_KEY_ENV_KEYS: Record<string, string> = {
   claude_local: ANTHROPIC_API_KEY_ENV_KEY,
   codex_local: "OPENAI_API_KEY",
+  // Copilot CLI reads a GitHub token (fine-grained PAT with Copilot access).
+  copilot_local: "COPILOT_GITHUB_TOKEN",
 };
 
 function apiKeyEnvKeyFor(adapterType: string): string {
@@ -2779,7 +2781,9 @@ function OnboardingWizardInner({
                       </p>
                     ) : credentialMode === "api" ? (
                       <OnboardingLoginCard
-                        instruction={savedKeys.options.length ? "Choose a saved API key or enter a new one" : `Provide your ${
+                        instruction={savedKeys.options.length ? "Choose a saved API key or enter a new one" : adapterType === "copilot_local"
+                          ? "Provide a GitHub token with Copilot access to connect"
+                          : `Provide your ${
                           CONNECT_SOURCE_NAMES[adapterType] ?? adapterType
                         } API key to connect`}
                       >
@@ -2898,7 +2902,12 @@ function OnboardingWizardInner({
                         }}
                       />
                     ) : hasSavedSubscription || localLogin.status === "ready" ? null : connectStepHasNoSandbox ? (
-                      canUseLocalLogin && managedProvider ? (
+                      adapterType === "copilot_local" ? (
+                        <p className="text-sm text-muted-foreground">
+                          GitHub Copilot uses the account you signed into with{" "}
+                          <span className="font-mono">copilot login</span> on this machine. Press Connect to verify it.
+                        </p>
+                      ) : canUseLocalLogin && managedProvider ? (
                         <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { autoConnectStartedRef.current = false; setError(null); localLogin.retry(); } }} />
                       ) : <p className="text-xs text-muted-foreground">This environment does not support browser sign-in. Choose another sign-in environment or connect with an API key.</p>
                     ) : null}

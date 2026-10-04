@@ -49,6 +49,7 @@ export type AdapterLoginChrome = "panel" | "onboarding";
 export const CONNECT_SOURCE_NAMES: Record<string, string> = {
   claude_local: "Claude",
   codex_local: "OpenAI",
+  copilot_local: "GitHub Copilot",
   grok_local: "Grok",
 };
 

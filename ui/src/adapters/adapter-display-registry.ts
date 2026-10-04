@@ -85,6 +85,7 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     label: "GitHub Copilot",
     description: "GitHub Copilot CLI harness",
     icon: Plane,
+    recommended: true,
   },
   paperclip_runner: {
     label: "Paperclip Runner",

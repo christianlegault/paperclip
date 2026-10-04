@@ -84,6 +84,7 @@ import { connectionIntentService } from "../services/connection-intents.js";
 import { redactRemoteUrlCredential } from "../services/remote-url-credentials.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import type { heartbeatService } from "../services/heartbeat.js";
+import { logger } from "../middleware/logger.js";
 
 const COMPANY_INSTALL_DENIAL_REASON =
   "Only someone who can configure this connection can choose this.";
@@ -1199,6 +1200,16 @@ function connectorEnrollmentPrincipal(req: Request): string {
       }
       res.json(result);
     } catch (callbackError) {
+      logger.warn(
+        {
+          err: callbackError instanceof Error ? { message: callbackError.message, name: callbackError.name } : String(callbackError),
+          details: callbackError instanceof HttpError ? callbackError.details : undefined,
+          providerError: error,
+          hasClaimId: Boolean(claimId),
+          connectionId: pendingState.connectionId,
+        },
+        "managed connector OAuth callback failed",
+      );
       if (!acceptsHtml) throw callbackError;
       const details = callbackError instanceof HttpError && callbackError.details && typeof callbackError.details === "object"
         ? callbackError.details as Record<string, unknown>
