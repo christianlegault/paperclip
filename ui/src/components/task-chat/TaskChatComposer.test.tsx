@@ -1028,7 +1028,10 @@ describe("TaskChatComposer", () => {
     expect(send.classList).toContain("rounded-full");
     expect(send.classList).toContain("bg-foreground");
     expect(send.classList).toContain("text-background");
-    expect(send.classList).toContain("disabled:opacity-100");
+    expect(send.disabled).toBe(true);
+    expect(send.classList).toContain("disabled:bg-muted");
+    expect(send.classList).toContain("disabled:text-muted-foreground");
+    expect(send.classList).not.toContain("disabled:opacity-100");
   });
 
   it("passes reopen=true when the issue resumes-to-todo and the assignee is an agent", async () => {
