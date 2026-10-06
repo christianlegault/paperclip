@@ -754,7 +754,7 @@ async function maybeAutoRestartChild() {
   if (!manualRestartRequest && dirtyPaths.size === 0 && pendingMigrations.length === 0) return;
 
   restartInFlight = true;
-  let health: { devServer?: { enabled?: boolean; autoRestartEnabled?: boolean; activeRunCount?: number } } | null = null;
+  let health: { devServer?: { enabled?: boolean; autoRestartEnabled?: boolean; activeRunCount?: number; serverProcessStartedAt?: string | null } } | null = null;
   try {
     health = await getDevHealthPayload();
   } catch {
@@ -767,12 +767,16 @@ async function maybeAutoRestartChild() {
     restartInFlight = false;
     return;
   }
+  // Authenticated deployments redact `serverInfo` from the token-authorized
+  // health response, so fall back to the identity carried in `devServer`.
   const observedServerIdentity =
     typeof (health as { serverInfo?: { processStartedAt?: unknown } })
       .serverInfo?.processStartedAt === "string"
       ? (health as { serverInfo: { processStartedAt: string } }).serverInfo
           .processStartedAt
-      : null;
+      : typeof devServer.serverProcessStartedAt === "string"
+        ? devServer.serverProcessStartedAt
+        : null;
   if (
     manualRestartRequest?.previousServerIdentity &&
     observedServerIdentity !== manualRestartRequest.previousServerIdentity

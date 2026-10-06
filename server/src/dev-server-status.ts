@@ -42,6 +42,9 @@ export type DevServerHealthStatus = {
   activeRunCount: number;
   waitingForIdle: boolean;
   lastRestartAt: string | null;
+  // Identity of the answering server process. The supervisor matches it
+  // against manual restart requests even when the rest of health is redacted.
+  serverProcessStartedAt?: string | null;
 };
 
 export type DevServerRestartRequest = {
@@ -302,7 +305,7 @@ export function readPersistedDevServerStatus(
 
 export function toDevServerHealthStatus(
   persisted: PersistedDevServerStatus,
-  opts: { autoRestartEnabled: boolean; activeRunCount: number },
+  opts: { autoRestartEnabled: boolean; activeRunCount: number; serverProcessStartedAt?: string | null },
 ): DevServerHealthStatus {
   const hasPathChanges = persisted.changedPathCount > 0;
   const hasPendingMigrations = persisted.pendingMigrations.length > 0;
@@ -329,5 +332,8 @@ export function toDevServerHealthStatus(
     waitingForIdle:
       restartRequired && opts.autoRestartEnabled && opts.activeRunCount > 0,
     lastRestartAt: persisted.lastRestartAt,
+    ...(opts.serverProcessStartedAt !== undefined
+      ? { serverProcessStartedAt: opts.serverProcessStartedAt }
+      : {}),
   };
 }

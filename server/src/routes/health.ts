@@ -364,6 +364,7 @@ export function healthRoutes(
       devServer = toDevServerHealthStatus(persistedDevServerStatus, {
         autoRestartEnabled: experimentalSettings.autoRestartDevServerWhenIdle ?? false,
         activeRunCount,
+        serverProcessStartedAt: serverInfo.processStartedAt ?? null,
       });
     }
 

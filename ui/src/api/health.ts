@@ -15,6 +15,7 @@ export type DevServerHealthStatus = {
   activeRunCount: number;
   waitingForIdle: boolean;
   lastRestartAt: string | null;
+  serverProcessStartedAt?: string | null;
 };
 
 export type CloudInstanceHealthStatus = {

@@ -122,6 +122,9 @@ describe("GET /health dev-server supervisor access", () => {
           activeRunCount: 0,
           waitingForIdle: false,
           lastRestartAt: "2026-03-20T11:30:00.000Z",
+          // The supervisor needs this to match manual restart requests; the
+          // redacted response has no `serverInfo` block.
+          serverProcessStartedAt: "2026-03-20T11:00:00.000Z",
         },
       });
     } finally {
