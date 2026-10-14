@@ -1,0 +1,139 @@
+schema: paperclip/v1
+
+# Monthly budgets in cents. Total: $150/month. The Researcher and Writer get the most.
+# Review cost per issue after the first 2-3 issues (the Editor logs it in the Ledger).
+agents:
+  editor-in-chief:
+    role: general
+    reportsToExistingAgentSlug: ceo
+    capabilities: Runs RoamSpoke Dispatch. Owns the issue calendar and Ledger, picks the region for each issue, sequences the pipeline, and submits final drafts to the board for approval. Never sends.
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 1500
+  region-strategist:
+    role: researcher
+    capabilities: Produces a monthly ranked shortlist of 3 Canada/USA bikepacking regions with rubric score breakdowns and a 4-week region plan, gated by a Researcher feasibility check and a rotation rule.
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 1000
+  route-researcher:
+    role: researcher
+    capabilities: Finds multi-day bikepacking routes from public sources and outputs structured, sourced stage data (distance, elevation, camping, resupply, water, season) as JSON. Also runs region feasibility checks.
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 4000
+  conditions-events-scout:
+    role: researcher
+    capabilities: Checks closures, fire/smoke, weather, permits, and upcoming races and group rides for the featured region, and runs a pre-send re-check of the featured route that can call HOLD SEND.
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 2000
+  writer:
+    role: general
+    capabilities: Writes the stage-by-stage Dispatch issue from structured route and conditions data, following the Dispatch style guide, and ends with "Copy this trip into RoamSpoke and invite your crew."
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 4000
+  fact-checker-qa:
+    role: qa
+    capabilities: Independently verifies every number, claim, link, source rule, and the CTA in each Dispatch draft against the Researcher's and Scout's sources, and issues a pass/fail report.
+    adapter:
+      type: copilot_local
+      config:
+        model: claude-opus-5.5
+        effort: high
+    runtime:
+      heartbeat:
+        enabled: false
+        wakeOnDemand: true
+    permissions:
+      canCreateAgents: false
+    budgetMonthlyCents: 2500
+
+tasks:
+  set-up-dispatch-ledger:
+    status: todo
+    priority: high
+  base-camp-integration-brief:
+    status: todo
+    priority: medium
+  first-region-shortlist:
+    status: todo
+    priority: high
+
+routines:
+  monthly-region-strategy:
+    triggers:
+      - kind: schedule
+        label: 1st of the month, 09:00 ET
+        cronExpression: "0 9 1 * *"
+        timezone: America/Toronto
+  issue-kickoff:
+    triggers:
+      - kind: schedule
+        label: Monday 08:00 ET
+        cronExpression: "0 8 * * 1"
+        timezone: America/Toronto
+  midweek-scout-and-draft:
+    triggers:
+      - kind: schedule
+        label: Tuesday 07:00 ET
+        cronExpression: "0 7 * * 2"
+        timezone: America/Toronto
+  qa-and-approval-gate:
+    triggers:
+      - kind: schedule
+        label: Wednesday 13:00 ET
+        cronExpression: "0 13 * * 3"
+        timezone: America/Toronto
+  pre-send-recheck:
+    triggers:
+      - kind: schedule
+        label: Thursday 07:00 ET (send day)
+        cronExpression: "0 7 * * 4"
+        timezone: America/Toronto
