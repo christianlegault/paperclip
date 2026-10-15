@@ -199,6 +199,43 @@ function fakeGitHubConnector(
   };
 }
 
+function mockDedicatedGitHubFetch() {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+    const href = String(url);
+    if (href === "https://api.github.com/user") {
+      return mcpHttpResponse({ id: 42, login: "octocat" });
+    }
+    if (href.includes("https://api.github.com/user/installations?")) {
+      return mcpHttpResponse({
+        installations: [
+          {
+            id: 101,
+            repository_selection: "selected",
+            html_url: "https://github.com/settings/installations/101",
+            account: { login: "paperclipai" },
+          },
+        ],
+      });
+    }
+    if (
+      href.includes("https://api.github.com/user/installations/101/repositories?")
+    ) {
+      return mcpHttpResponse({
+        total_count: 1,
+        repositories: [{ id: 1, full_name: "paperclipai/repo-1" }],
+      });
+    }
+    if (href === GITHUB_CONNECTOR_PROFILES["github.code"].serverUrl) {
+      return mcpHttpResponse(
+        catalogResponse([
+          { name: "get_pull_request", annotations: { readOnlyHint: true } },
+        ]),
+      );
+    }
+    throw new Error(`unexpected fetch ${href}`);
+  });
+}
+
 function createToolGatewayService(
   db: ReturnType<typeof createDb>,
   options: NonNullable<Parameters<typeof createToolGatewayServiceBase>[1]> = {},
@@ -7806,6 +7843,211 @@ describeEmbeddedPostgres("tool access service", () => {
       }
     },
   );
+
+  it("reconnects a dedicated GitHub identity onto its existing agent when the caller omits the agent", async () => {
+    const company = await createCompany(db);
+    const userId = `github-dedicated-reconnect-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "owner");
+    const agent = await createAgent(db, company.id);
+    const connector = fakeGitHubConnector(company.id, `agent:${agent.id}`);
+    const service = createTestToolAccessService(db, {
+      paperclipCloudConnector: connector,
+    });
+    const actor = { actorType: "user" as const, actorId: userId };
+    const githubDefinition = getConnectableAppDefinition("github")!;
+    const previousOwnershipAvailability =
+      githubDefinition.ownershipAvailability;
+    githubDefinition.ownershipAvailability = {
+      ...previousOwnershipAvailability,
+      platform_shared: true,
+    };
+    mockDedicatedGitHubFetch();
+    const redirectUri =
+      "https://paperclip.example/api/tools/oauth/cloud-connector/callback";
+    let subjectCheckDropped: string | null = null;
+
+    try {
+      const connected = await service.connectGalleryApp(
+        company.id,
+        {
+          galleryKey: "github",
+          connectionMethodKey: "managed",
+          grantKind: "agent",
+          subjectAgentId: agent.id,
+          name: "Agent GitHub",
+        },
+        actor,
+      );
+      const firstStart = await service.startOAuth(
+        company.id,
+        connected.connectionId,
+        { redirectUri, actor, subjectAgentId: agent.id },
+      );
+      await service.completePaperclipCloudConnectorCallback({
+        state: new URL(firstStart.authorizationUrl).searchParams.get("state")!,
+        claimId: "github-dedicated-first",
+        actor,
+      });
+
+      // Simulates a grant left behind by an earlier agentless reconnect on an
+      // instance whose backup restore dropped the subject check constraint.
+      const [subjectCheck] = (await db.execute(sql`
+        SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+        WHERE conrelid = 'connection_grants'::regclass AND conname = 'connection_grants_subject_check'
+      `)) as unknown as Array<{ definition: string }>;
+      await db.execute(sql`ALTER TABLE connection_grants DROP CONSTRAINT connection_grants_subject_check`);
+      subjectCheckDropped = subjectCheck!.definition;
+      const [orphan] = await db
+        .insert(connectionGrants)
+        .values({
+          companyId: company.id,
+          connectionId: connected.connectionId,
+          kind: "agent",
+          subjectAgentId: null,
+          status: "active",
+        })
+        .returning();
+
+      // The app page's Reconnect button only knows the connection.
+      const reconnectStart = await service.startOAuth(
+        company.id,
+        connected.connectionId,
+        { redirectUri, actor },
+      );
+      expect(connector.startAuthorization).toHaveBeenLastCalledWith(
+        expect.objectContaining({ subject: `agent:${agent.id}` }),
+      );
+      const reconnected = await service.completePaperclipCloudConnectorCallback({
+        state: new URL(reconnectStart.authorizationUrl).searchParams.get("state")!,
+        claimId: "github-dedicated-reconnect",
+        actor,
+      });
+
+      const agentGrants = await db
+        .select()
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.connectionId, connected.connectionId),
+            eq(connectionGrants.kind, "agent"),
+          ),
+        );
+      expect(agentGrants).toHaveLength(2);
+      expect(agentGrants.find((grant) => grant.id === orphan.id)).toMatchObject({
+        status: "revoked",
+        revokedByUserId: userId,
+      });
+      expect(agentGrants.find((grant) => grant.id !== orphan.id)).toMatchObject({
+        subjectAgentId: agent.id,
+        subjectUserId: null,
+        status: "active",
+      });
+      expect(
+        (reconnected.connection.config as { oauth?: Record<string, unknown> })
+          .oauth?.connectorSubjectAgentId,
+      ).toBe(agent.id);
+
+      const otherAgent = await createAgent(db, company.id);
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: connected.connectionId,
+        kind: "agent",
+        subjectAgentId: otherAgent.id,
+        status: "active",
+      });
+      await expect(
+        service.startOAuth(company.id, connected.connectionId, {
+          redirectUri,
+          actor,
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+    } finally {
+      githubDefinition.ownershipAvailability = previousOwnershipAvailability;
+      if (subjectCheckDropped) {
+        await db.execute(sql.raw(
+          `ALTER TABLE connection_grants ADD CONSTRAINT connection_grants_subject_check ${subjectCheckDropped} NOT VALID`,
+        ));
+      }
+    }
+  });
+
+  it("rejects a dedicated GitHub sign-in whose account already backs another agent", async () => {
+    const company = await createCompany(db);
+    const userId = `github-dedicated-conflict-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "owner");
+    const firstAgent = await createAgent(db, company.id);
+    const secondAgent = await createAgent(db, company.id);
+    const connector = fakeGitHubConnector(company.id, `agent:${firstAgent.id}`);
+    const service = createTestToolAccessService(db, {
+      paperclipCloudConnector: connector,
+    });
+    const actor = { actorType: "user" as const, actorId: userId };
+    const githubDefinition = getConnectableAppDefinition("github")!;
+    const previousOwnershipAvailability =
+      githubDefinition.ownershipAvailability;
+    githubDefinition.ownershipAvailability = {
+      ...previousOwnershipAvailability,
+      platform_shared: true,
+    };
+    mockDedicatedGitHubFetch();
+    const redirectUri =
+      "https://paperclip.example/api/tools/oauth/cloud-connector/callback";
+    const connectDedicated = async (agentId: string, name: string) => {
+      const connected = await service.connectGalleryApp(
+        company.id,
+        {
+          galleryKey: "github",
+          connectionMethodKey: "managed",
+          grantKind: "agent",
+          subjectAgentId: agentId,
+          name,
+        },
+        actor,
+      );
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri,
+        actor,
+        subjectAgentId: agentId,
+      });
+      return {
+        connectionId: connected.connectionId,
+        complete: () =>
+          service.completePaperclipCloudConnectorCallback({
+            state: new URL(start.authorizationUrl).searchParams.get("state")!,
+            claimId: `github-dedicated-${agentId}`,
+            actor,
+          }),
+      };
+    };
+
+    try {
+      const first = await connectDedicated(firstAgent.id, "First GitHub");
+      await first.complete();
+      const second = await connectDedicated(secondAgent.id, "Second GitHub");
+      await expect(second.complete()).rejects.toMatchObject({
+        status: 409,
+        details: expect.objectContaining({
+          code: "dedicated_github_account_in_use",
+          conflictingAgentId: firstAgent.id,
+        }),
+      });
+      const secondGrants = await db
+        .select()
+        .from(connectionGrants)
+        .where(eq(connectionGrants.connectionId, second.connectionId));
+      expect(secondGrants).toHaveLength(0);
+
+      // Once the first identity is no longer active the account is free again.
+      await db
+        .update(connectionGrants)
+        .set({ status: "needs_reauthorization" })
+        .where(eq(connectionGrants.subjectAgentId, firstAgent.id));
+      const retry = await connectDedicated(secondAgent.id, "Second GitHub retry");
+      await expect(retry.complete()).resolves.toBeTruthy();
+    } finally {
+      githubDefinition.ownershipAvailability = previousOwnershipAvailability;
+    }
+  });
 
   it("replaces an archived dedicated GitHub identity with an explicitly selected personal identity", async () => {
     const company = await createCompany(db);

@@ -92,6 +92,8 @@ a reconnect requirement.
 
 An explicit dedicated-agent grant overrides personal selection. Revoked, disabled, unavailable, or ambiguous dedicated grants do not fall back to a person's account. Removing the dedicated configuration restores personal selection.
 
+Each dedicated identity belongs to exactly one agent and needs its own GitHub account. Reconnecting a dedicated connection always re-authorizes its existing agent's grant, even when the caller omits the agent, and retires any agentless grant left by older reconnects. A dedicated sign-in is rejected with `dedicated_github_account_in_use` when the GitHub account already backs another agent's active dedicated identity, because each new authorization for one account can invalidate the other agent's token.
+
 Connection setup and permissions display: “This agent uses this GitHub account for everyone's work, instead of the person giving instructions.”
 
 The GitHub permissions page shows repositories across all connected accounts in one scrollable list. It has no account filter or repository search. Repository icons, private-repository indicators, refresh, and GitHub configuration links remain available. The “Add More Repos on GitHub” button opens GitHub’s app installation and repository-access setup.

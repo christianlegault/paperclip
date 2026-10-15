@@ -14418,6 +14418,96 @@ export function toolAccessService(
   }
 
   /**
+   * Two agents' dedicated identities must not share one GitHub account: each new
+   * authorization for the account can invalidate the other agent's token, so
+   * reconnecting either agent silently breaks the other.
+   */
+  async function assertDedicatedGitHubAccountUnclaimed(input: {
+    companyId: string;
+    subjectAgentId: string;
+    githubUserId: string;
+    githubLogin: string;
+  }): Promise<void> {
+    const githubUserId = input.githubUserId.trim();
+    if (!githubUserId) return;
+    const others = await db
+      .select({
+        agentId: connectionGrants.subjectAgentId,
+        agentName: agents.name,
+        providerTenant: connectionGrants.providerTenant,
+      })
+      .from(connectionGrants)
+      .innerJoin(
+        toolConnections,
+        eq(toolConnections.id, connectionGrants.connectionId),
+      )
+      .leftJoin(agents, eq(agents.id, connectionGrants.subjectAgentId))
+      .where(
+        and(
+          eq(connectionGrants.companyId, input.companyId),
+          eq(connectionGrants.kind, "agent"),
+          eq(connectionGrants.status, "active"),
+          isNotNull(connectionGrants.subjectAgentId),
+          ne(connectionGrants.subjectAgentId, input.subjectAgentId),
+          ne(toolConnections.status, "archived"),
+        ),
+      );
+    const owner = others.find(
+      (row) => row.providerTenant?.github?.userId?.trim() === githubUserId,
+    );
+    if (!owner) return;
+    const ownerName = owner.agentName ?? "another agent";
+    throw conflict(
+      `GitHub account @${input.githubLogin} is already the dedicated identity for ${ownerName}. ` +
+        `Sharing one GitHub account between dedicated identities makes each sign-in invalidate the other. ` +
+        `Sign in with a different GitHub account, or disconnect ${ownerName}'s identity first.`,
+      {
+        code: "dedicated_github_account_in_use",
+        conflictingAgentId: owner.agentId,
+      },
+    );
+  }
+
+  /**
+   * A dedicated (per-agent) connection belongs to exactly one agent. Reconnect
+   * callers that only know the connection must reuse that agent; otherwise the
+   * sign-in falls back to the board user and stores an agent grant with no agent.
+   */
+  async function fixedDedicatedAgentForReconnect(
+    connection: typeof toolConnections.$inferSelect,
+    requestedSubjectAgentId: string | undefined,
+  ): Promise<string | undefined> {
+    if (connection.credentialPolicy !== "per_agent" || requestedSubjectAgentId) {
+      return requestedSubjectAgentId;
+    }
+    const boundAgentIds = new Set<string>();
+    const configuredAgentId = oauthConfig(connection).connectorSubjectAgentId;
+    if (typeof configuredAgentId === "string" && configuredAgentId.trim()) {
+      boundAgentIds.add(configuredAgentId.trim());
+    }
+    const agentGrants = await db
+      .select({ subjectAgentId: connectionGrants.subjectAgentId })
+      .from(connectionGrants)
+      .where(
+        and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          eq(connectionGrants.kind, "agent"),
+        ),
+      );
+    for (const grant of agentGrants) {
+      if (grant.subjectAgentId) boundAgentIds.add(grant.subjectAgentId);
+    }
+    if (boundAgentIds.size !== 1) {
+      throw badRequest(
+        "Choose the agent this dedicated identity belongs to before reconnecting",
+        { code: "dedicated_agent_identity_required" },
+      );
+    }
+    return [...boundAgentIds][0];
+  }
+
+  /**
    * Replace the credential(s) on an existing connection and re-run the health
    * check — the "Replace key" / reconnect flow (M7, PAP-10859). Rotates the
    * secret in place when a ref already exists so the connection keeps its
@@ -14645,7 +14735,10 @@ export function toolAccessService(
     );
     const authorizationSubjectUserId =
       fixedPersonalIdentity?.subjectUserId ?? input.subjectUserId;
-    const authorizationSubjectAgentId = input.subjectAgentId;
+    const authorizationSubjectAgentId = await fixedDedicatedAgentForReconnect(
+      connection,
+      input.subjectAgentId,
+    );
     if (authorizationSubjectAgentId) {
       const [subjectAgent] = await db
         .select({ id: agents.id })
@@ -15507,6 +15600,12 @@ export function toolAccessService(
     }
     const subjectUserId = stateRow.subjectUserId;
     const subjectAgentId = stateRow.subjectAgentId;
+    if (connection.credentialPolicy === "per_agent" && !subjectAgentId) {
+      throw badRequest(
+        "This dedicated identity sign-in did not name its agent. Reconnect it again.",
+        { code: "dedicated_agent_identity_required" },
+      );
+    }
     if (
       !method ||
       !isPaperclipCloudConnectorStrategy(method.oauthStrategy) ||
@@ -15555,6 +15654,18 @@ export function toolAccessService(
       throw forbidden(
         `A signed-in connection manager must authorize ${providerName}`,
       );
+    if (
+      connection.credentialPolicy === "per_agent" &&
+      subjectAgentId &&
+      githubMetadata
+    ) {
+      await assertDedicatedGitHubAccountUnclaimed({
+        companyId: connection.companyId,
+        subjectAgentId,
+        githubUserId: githubMetadata.userId,
+        githubLogin: githubMetadata.login,
+      });
+    }
 
     await db.transaction(async (tx) => {
       // Keep connector credential persistence serialized with membership
@@ -15717,6 +15828,28 @@ export function toolAccessService(
         revokedByUserId: null,
         updatedAt: now(),
       };
+      if (agentCredential) {
+        // Earlier reconnects could store a dedicated grant without its agent.
+        // No run can resolve such a grant, but it still makes the connection
+        // look healthy, so retire it once the real agent grant is rotated.
+        await tx
+          .update(connectionGrants)
+          .set({
+            status: "revoked",
+            revokedAt: now(),
+            revokedByUserId: authorizingUserId,
+            updatedAt: now(),
+          })
+          .where(
+            and(
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.kind, "agent"),
+              isNull(connectionGrants.subjectAgentId),
+              ne(connectionGrants.status, "revoked"),
+            ),
+          );
+      }
       if (existingCredentialGrant) {
         await tx
           .update(connectionGrants)

@@ -136,6 +136,41 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     }
   }, 30_000);
 
+  it("preserves check constraints, including NOT VALID ones, across backup and restore", async () => {
+    const source = await createTempDatabase();
+    const target = await createSiblingDatabase(source, "check_restore_target");
+    const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+    const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+    try {
+      await sourceSql.unsafe(`
+        CREATE SCHEMA check_fixture;
+        CREATE TABLE check_fixture.grants (
+          id integer PRIMARY KEY,
+          kind text NOT NULL,
+          subject text,
+          CONSTRAINT grants_subject_check CHECK (kind <> 'agent' OR subject IS NOT NULL)
+        );
+        INSERT INTO check_fixture.grants VALUES (1, 'agent', 'a'), (2, 'org', NULL), (3, 'legacy', '');
+        ALTER TABLE check_fixture.grants ADD CONSTRAINT grants_legacy_check CHECK (subject <> '') NOT VALID;
+      `);
+      const backup = await runDatabaseBackup({ connectionString: source, backupDir: createTempDir("check-backup-"), backupEngine: "javascript", retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+      expect(await targetSql`
+        SELECT conname, convalidated FROM pg_constraint
+        WHERE conrelid = 'check_fixture.grants'::regclass AND contype = 'c'
+        ORDER BY conname
+      `).toEqual([
+        { conname: "grants_legacy_check", convalidated: false },
+        { conname: "grants_subject_check", convalidated: true },
+      ]);
+      expect(await targetSql`SELECT count(*)::int AS n FROM check_fixture.grants`).toEqual([{ n: 3 }]);
+      await expect(targetSql`INSERT INTO check_fixture.grants VALUES (4, 'agent', NULL)`).rejects.toThrow("grants_subject_check");
+    } finally {
+      await sourceSql.end();
+      await targetSql.end();
+    }
+  }, 30_000);
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
