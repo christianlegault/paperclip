@@ -40,6 +40,9 @@ services:
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
     volumes:
       - paperclip-data:/paperclip
+      - type: bind
+        source: ${DOC_ARC_KIT_PATH:-C:/DATA/Git/doc-arc-kit}
+        target: /doc-arc-kit
     depends_on:
       db:
         condition: service_healthy
