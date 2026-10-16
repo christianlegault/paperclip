@@ -59,6 +59,19 @@ export function legacyDispositionEpisode(run: {
 export function legacyDispositionFingerprint(companyId: string, issueId: string, agentId: string, episodeId: string) {
   return `legacy_disposition:v1:${createHash("sha256").update(JSON.stringify([companyId, issueId, agentId, episodeId])).digest("hex")}`;
 }
+/** Dispatch withheld this repair before the provider handoff: an expected stop with no action outcomes to reconcile. */
+export function legacyRepairSuppressionPatch(repairBlock: string, now = new Date()) {
+  const reason = `Disposition repair suppressed: ${repairBlock}`;
+  return {
+    finishedAt: now,
+    errorCode: "legacy_disposition_repair_suppressed",
+    error: reason,
+    resultJson: {
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      cancellation: { source: "control_plane", expected: true, initiator: { type: "system" }, reason, recordedAt: now.toISOString() },
+    },
+  };
+}
 export function decideLegacyContinuation(input: LegacyContinuationInput):
   | { kind: "skip"; reason: string }
   | { kind: "exhausted"; attempt: number; maxAttempts: number }

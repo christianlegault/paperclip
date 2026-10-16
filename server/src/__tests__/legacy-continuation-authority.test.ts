@@ -4,6 +4,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { legacyRepairSuppressionPatch } from "../services/recovery/legacy-continuation.js";
+import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { cancellationResultJson, readRunCancellation } from "../services/run-cancellation.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 describe("legacy continuation persisted authority", () => {
@@ -250,5 +254,26 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.runs()).toHaveLength(2);
     const repair = (await f.runs()).find(r => r.id !== f.runId)!;
     expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
+  });
+  it.each([
+    ["suppression evidence", false],
+    ["the pre-fix patch", true],
+  ])("durable_wait dispatch suppression with %s creates an execution hold: %s", async (_label, expectHold) => {
+    const withEvidence = !expectHold;
+    const f = await fixture({ executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 0 } });
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const queued = (await f.runs()).find(r => r.id !== f.runId)!;
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "connection_intent", status: "pending", payload: { version: 1 } });
+    expect(await f.createRecovery().legacyRepairDispatchBlock(queued.id)).toBe("durable_wait");
+    const [running] = await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id)).returning();
+    const suppression = legacyRepairSuppressionPatch("durable_wait");
+    const patch = withEvidence ? suppression : { ...suppression, resultJson: undefined };
+    // Same composition as setRunStatusIfRunning for a legacy cancellation.
+    await terminalizeLegacyExecution({ db, run: running, status: "cancelled", fromStatuses: ["running"], reconcileIfNeeded: true,
+      patch: { ...patch, resultJson: cancellationResultJson(running, "cancelled", patch.resultJson, patch.errorCode, patch.error) } });
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued.id));
+    expect(finished).toMatchObject({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed" });
+    expect(readRunCancellation(finished.resultJson)?.expected).toBe(withEvidence);
+    expect(Boolean(await getExecutionBlocker(db, f.companyId, f.issueId))).toBe(expectHold);
   });
 });

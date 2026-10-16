@@ -457,6 +457,7 @@ import {
 } from "./recovery/stranded-notice.js";
 
 import { recoveryService } from "./recovery/service.js";
+import { legacyRepairSuppressionPatch } from "./recovery/legacy-continuation.js";
 import {
   createRunDispatch,
   type PostCommitEffect,
@@ -2797,10 +2798,7 @@ export function heartbeatService(
           return { dispatched: false };
         const repairBlock = await recovery.legacyRepairDispatchBlock(run.id);
         if (repairBlock) {
-          const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
-            finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
-            error: `Disposition repair suppressed: ${repairBlock}`,
-          });
+          const cancelled = await setRunStatusIfRunning(run.id, "cancelled", legacyRepairSuppressionPatch(repairBlock));
           if (cancelled.updated) {
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });
             await releaseIssueExecutionAndPromote(cancelled.run!, { suppressImmediateRecovery: true });

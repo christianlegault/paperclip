@@ -14460,7 +14460,7 @@ export function toolAccessService(
     throw conflict(
       `GitHub account @${input.githubLogin} is already the dedicated identity for ${ownerName}. ` +
         `Sharing one GitHub account between dedicated identities makes each sign-in invalidate the other. ` +
-        `Sign in with a different GitHub account, or disconnect ${ownerName}'s identity first.`,
+        `Sign in with a different GitHub account, or connect @${input.githubLogin} once as a personal GitHub identity so every agent working for you shares it.`,
       {
         code: "dedicated_github_account_in_use",
         conflictingAgentId: owner.agentId,

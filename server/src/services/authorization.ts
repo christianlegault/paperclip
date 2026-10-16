@@ -514,6 +514,15 @@ type ResponsibleUserActorWithMemo = AuthorizationActor & {
   __responsibleUserSnapshotMemo?: Map<string, Promise<ResponsibleUserSnapshot>>;
 };
 
+/** Caller-owned cache of authorization row lookups for one bounded operation,
+ * such as a single locked transaction. Decisions are still evaluated in full;
+ * only identical row reads are shared. Never retain one across requests. */
+export type AuthorizationLookupMemo = Map<string, Promise<unknown>>;
+
+export function createAuthorizationLookupMemo(): AuthorizationLookupMemo {
+  return new Map();
+}
+
 const responsibleUserSnapshotCache = new Map<
   string,
   { expiresAt: number; promise: Promise<ResponsibleUserSnapshot> }
@@ -726,19 +735,29 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export function authorizationService(db: Db | DbTransaction) {
+export function authorizationService(db: Db | DbTransaction, options: { lookupMemo?: AuthorizationLookupMemo } = {}) {
+  const lookupMemo = options.lookupMemo;
+  function memoizedLookup<T>(key: string, load: () => Promise<T>): Promise<T> {
+    if (!lookupMemo) return load();
+    const existing = lookupMemo.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+    const promise = load();
+    lookupMemo.set(key, promise);
+    void promise.catch(() => {
+      if (lookupMemo.get(key) === promise) lookupMemo.delete(key);
+    });
+    return promise;
+  }
+
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
-    if (
+    return memoizedLookup(`instance-admin:${userId}`, async () => Boolean(
       await db
         .select({ id: instanceUserRoles.id })
         .from(instanceUserRoles)
         .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-        .then((rows) => rows[0] ?? null)
-    ) {
-      return true;
-    }
-    return false;
+        .then((rows) => rows[0] ?? null),
+    ));
   }
 
   async function getActiveMembership(
@@ -746,7 +765,7 @@ export function authorizationService(db: Db | DbTransaction) {
     principalType: PrincipalType,
     principalId: string,
   ) {
-    return db
+    return memoizedLookup(`membership:${companyId}:${principalType}:${principalId}`, () => db
       .select()
       .from(companyMemberships)
       .where(
@@ -757,7 +776,7 @@ export function authorizationService(db: Db | DbTransaction) {
           eq(companyMemberships.status, "active"),
         ),
       )
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadResponsibleUserSnapshot(companyId: string, userId: string): Promise<ResponsibleUserSnapshot> {
@@ -833,7 +852,7 @@ export function authorizationService(db: Db | DbTransaction) {
     principalId: string,
     permissionKey: PermissionKey,
   ) {
-    return db
+    return memoizedLookup(`grant:${companyId}:${principalType}:${principalId}:${permissionKey}`, () => db
       .select()
       .from(principalPermissionGrants)
       .where(
@@ -844,7 +863,7 @@ export function authorizationService(db: Db | DbTransaction) {
           eq(principalPermissionGrants.permissionKey, permissionKey),
         ),
       )
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function decidePrincipalGrant(input: {
@@ -918,7 +937,7 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    return db
+    return memoizedLookup(`agent:${agentId}`, () => db
       .select({
         id: agents.id,
         companyId: agents.companyId,
@@ -929,11 +948,11 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(agents)
       .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
-    return db
+    return memoizedLookup(`project:${projectId}`, () => db
       .select({
         id: projects.id,
         companyId: projects.companyId,
@@ -941,11 +960,11 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(projects)
       .where(eq(projects.id, projectId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    return db
+    return memoizedLookup(`issue:${issueId}`, () => db
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -961,12 +980,11 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
-  async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
-    const row = await db
+  function loadRunContextRow(runId: string) {
+    return memoizedLookup(`run-context:${runId}`, () => db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -975,7 +993,12 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
+  }
+
+  async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
+    if (!runId) return null;
+    const row = await loadRunContextRow(runId);
     if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
     const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
     return isPlainRecord(context?.executionPolicy)
@@ -985,15 +1008,7 @@ export function authorizationService(db: Db | DbTransaction) {
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
-    const row = await db
-      .select({
-        companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+    const row = await loadRunContextRow(runId);
     if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
     const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
     const issueId = typeof context?.issueId === "string"
@@ -1024,20 +1039,20 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadProjectAuthorizationPolicy(companyId: string, projectId: string) {
-    const row = await db
+    const row = await memoizedLookup(`project-policy:${companyId}:${projectId}`, () => db
       .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
       .from(projects)
       .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     return readPolicyObject(row?.executionWorkspacePolicy, "authorizationPolicy");
   }
 
   async function loadIssueAuthorizationPolicy(companyId: string, issueId: string) {
-    const row = await db
+    const row = await memoizedLookup(`issue-policy:${companyId}:${issueId}`, () => db
       .select({ executionPolicy: issues.executionPolicy })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     return readPolicyObject(row?.executionPolicy, "authorizationPolicy");
   }
 
@@ -2647,11 +2662,12 @@ export function authorizationService(db: Db | DbTransaction) {
       && intersectedDecision.reason !== "allow_local_board"
       && issuePrivacyMode() !== "off"
     ) {
-      const project = await db
+      const projectId = input.resource.projectId;
+      const project = await memoizedLookup(`project-privacy:${input.resource.companyId}:${projectId}`, () => db
         .select({ id: projects.id, companyId: projects.companyId, visibility: projects.visibility })
         .from(projects)
-        .where(and(eq(projects.id, input.resource.projectId), eq(projects.companyId, input.resource.companyId)))
-        .then((rows) => rows[0] ?? null);
+        .where(and(eq(projects.id, projectId), eq(projects.companyId, input.resource.companyId)))
+        .then((rows) => rows[0] ?? null));
       if (project && !(await canActorReadProjectPrivacy(db, input.actor, project))) {
         const denied = deny({
           action: input.action,
@@ -2681,7 +2697,8 @@ export function authorizationService(db: Db | DbTransaction) {
       || issuePrivacyMode() === "off"
     ) return intersectedDecision;
 
-    const issue = await db
+    const issueId = input.resource.issueId;
+    const issue = await memoizedLookup(`issue-privacy:${input.resource.companyId}:${issueId}`, () => db
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -2694,8 +2711,8 @@ export function authorizationService(db: Db | DbTransaction) {
         projectId: issues.projectId,
       })
       .from(issues)
-      .where(and(eq(issues.id, input.resource.issueId), eq(issues.companyId, input.resource.companyId)))
-      .then((rows) => rows[0] ?? null);
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, input.resource.companyId)))
+      .then((rows) => rows[0] ?? null));
     if (!issue || await canActorReadIssuePrivacy(db, input.actor, issue)) return intersectedDecision;
 
     const denied = deny({
@@ -2743,6 +2760,12 @@ export function authorizationService(db: Db | DbTransaction) {
   };
 }
 
+/** Index-friendly id for a text key. Malformed keys become NULL instead of
+ * failing the cast; callers keep the exact `id::text = key` comparison. */
+function indexableIssueIdFromText(key: SQL): SQL {
+  return sql`(case when ${key} ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then (${key})::uuid end)`;
+}
+
 /** A workspace can contain several tasks. Reading files/operations requires
  * access to every task bound to it, not just the task that originally made it. */
 export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor): Promise<SQL<boolean>> {
@@ -2753,7 +2776,8 @@ export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction,
       select 1 from ${projects} where ${projects.id} = ${executionWorkspaces.projectId}
         and ${projects.companyId} = ${executionWorkspaces.companyId} and ${projectCondition}))
     and not exists (select 1 from jsonb_object_keys(coalesce(${executionWorkspaces.metadata}->'_issuePrivacySources', '{}'::jsonb)) source(id)
-      where not exists (select 1 from ${issues} where ${issues.id}::text = source.id
+      where not exists (select 1 from ${issues} where ${issues.id} = ${indexableIssueIdFromText(sql`source.id`)}
+        and ${issues.id}::text = source.id
         and ${issues.companyId} = ${executionWorkspaces.companyId} and ${issueCondition}))
     and not exists (select 1 from ${issues}
       where ${issues.companyId} = ${executionWorkspaces.companyId}

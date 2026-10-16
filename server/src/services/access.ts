@@ -17,7 +17,7 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
+import { authorizationService, type AuthorizationActor, type AuthorizationLookupMemo, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
@@ -33,8 +33,8 @@ type MemberArchiveInput = {
   } | null;
 };
 
-export function accessService(db: Db) {
-  const authorization = authorizationService(db);
+export function accessService(db: Db, options: { lookupMemo?: AuthorizationLookupMemo } = {}) {
+  const authorization = authorizationService(db, options);
 
   async function sweepMemberConnectionAccess(
     tx: Parameters<Parameters<Db["transaction"]>[0]>[0],

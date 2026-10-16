@@ -784,6 +784,12 @@ retained low-trust policy counts as standard. Live policy edits cannot relabel
 a standard local run as sandboxed. Read-only file access
 keeps its existing authorization rules.
 
+Retained readers are never deleted. On a single-operator instance,
+`PAPERCLIP_WORKSPACE_ROOT_RELEASE_FINISHED_READERS=true` makes readers whose
+runs have finished stop constraining a shared root. Active readers and readers
+whose run cannot be found are still checked, and turning the setting off
+restores the full check.
+
 Source-copy checks retain deny-only ownership on failure but create a new
 isolated-copy proof only after physical identity, access, and trust checks pass.
 For low-trust sandbox runs, the harness also disables host worktree provisioning

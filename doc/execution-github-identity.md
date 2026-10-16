@@ -92,7 +92,7 @@ a reconnect requirement.
 
 An explicit dedicated-agent grant overrides personal selection. Revoked, disabled, unavailable, or ambiguous dedicated grants do not fall back to a person's account. Removing the dedicated configuration restores personal selection.
 
-Each dedicated identity belongs to exactly one agent and needs its own GitHub account. Reconnecting a dedicated connection always re-authorizes its existing agent's grant, even when the caller omits the agent, and retires any agentless grant left by older reconnects. A dedicated sign-in is rejected with `dedicated_github_account_in_use` when the GitHub account already backs another agent's active dedicated identity, because each new authorization for one account can invalidate the other agent's token.
+Each dedicated identity belongs to exactly one agent and needs its own GitHub account. Reconnecting a dedicated connection always re-authorizes its existing agent's grant, even when the caller omits the agent, and retires any agentless grant left by older reconnects. A dedicated sign-in is rejected with `dedicated_github_account_in_use` when the GitHub account already backs another agent's active dedicated identity, because each new authorization for one account can invalidate the other agent's token. The check runs after GitHub has issued the new token, so it reports the conflict but cannot prevent that invalidation. To let several agents use one person's GitHub account, connect it once as that person's personal identity instead of as several dedicated identities.
 
 Connection setup and permissions display: “This agent uses this GitHub account for everyone's work, instead of the person giving instructions.”
 
