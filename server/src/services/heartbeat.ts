@@ -1,12 +1,24 @@
+import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
+import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
+import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
+import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "./heartbeat/case-handoff-lifecycle.js";
+import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
+import { dotRunnerBroker } from "./dot-runner-broker.js";
+import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
+import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
 import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
 import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, recordHeartbeatAdapterRuntimeServices } from "./heartbeat/runtime-services.js";
-import { prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
+import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
+import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
+import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
+import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
 export {
@@ -37,6 +49,7 @@ import {
   isHeartbeatRunTerminalStatus,
   decorateHeartbeatRunRuntimeStatus,
   createHeartbeatLifecycle,
+  persistHeartbeatRunProcessMetadata,
 } from "./heartbeat/run-lifecycle.js";
 export {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
@@ -323,12 +336,6 @@ import {
 import { HttpError, notFound } from "../errors.js";
 
 import { logger } from "../middleware/logger.js";
-import {
-  scrubGitCredentialText,
-} from "./git-credentials.js";
-// Re-exported because heartbeat's workspace surface exposed the scrubber before the
-// git-credentials module became its canonical home; existing importers keep working.
-export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 
 import {
@@ -370,8 +377,6 @@ import {
   isNativeRunnerOwnershipHeld,
   NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
 } from "./native-runtime/native-runner-ownership.js";
-import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
-import { getTelemetryClient } from "../telemetry.js";
 import {
   emitAgentTaskRun,
   emitAgentTaskRunById,
@@ -801,6 +806,7 @@ export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
 ) {
+  const { finalizeAgentStatus } = createHeartbeatAgentStatus(db);
   const {
     getAgent,
     resolveSessionBeforeForWakeup,
@@ -906,7 +912,7 @@ export function heartbeatService(
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
-  const executionWorkspacesSvc = executionWorkspaceService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db, { pluginWorkerManager: options.pluginWorkerManager });
   const environmentsSvc = environmentService(db);
   const environmentRuntime =
     options.environmentRuntime ??
@@ -956,12 +962,14 @@ export function heartbeatService(
     timerClaimWasFirstHeartbeat,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     findSharedWorkspaceHolder,
+    findExecutionWorkspaceHolder,
     finalizeAiConnectionBusyDeferral,
     finalizeWorkspaceBusyDeferral,
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
     scheduleBoundedRetry,
   } = createHeartbeatRetries(db, {
+    hasCaseHandoffForRun: async (run) => Boolean(await pendingCaseHandoffForRun(db, run.id, run.companyId)),
     appendRunEvent,
     escalatePlanApprovalResumeFailureNeedsAttention,
     getAgentInvokability,
@@ -1208,6 +1216,13 @@ export function heartbeatService(
   });
 
   const heartbeatQueue = createHeartbeatQueue(db, {
+    canStartNewExternalBotWork: async agent => {
+      if (agent.adapterType !== "paperclip_runner" || agent.adapterConfig.provider !== "grok_bot") return true;
+      const aiConnection = aiRuntimeConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection);
+      if (aiConnection.success && aiConnection.data.mode === "router") return true;
+      return dotRunnerBroker(db).canStartNewWork(agent.companyId, agent.id,
+        readNonEmptyString(agent.adapterConfig.externalBindingId) ?? "");
+    },
     applyWakeQueuePostCommitEffects,
     setRunStatus,
     setWakeupStatus,
@@ -1257,7 +1272,6 @@ export function heartbeatService(
   });
 
   const {
-    countRunningRunsForAgent,
     releaseRunClaimedJustBeforeSuppression,
     claimQueuedRun,
     withChatControlRecoveryGate,
@@ -1543,85 +1557,6 @@ export function heartbeatService(
     void reportRunFailure(db, updated, failureReport);
   }
 
-  function truncateAgentErrorReason(
-    reason: string | null | undefined,
-  ): string | null {
-    if (!reason) return null;
-    const trimmed = reason.trim();
-    if (!trimmed) return null;
-    return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
-  }
-
-  async function finalizeAgentStatus(
-    agentId: string,
-    outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
-    failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
-  ) {
-    const existing = await getAgent(agentId);
-    if (!existing) return;
-
-    if (existing.status === "paused" || existing.status === "terminated") {
-      return;
-    }
-
-    const isFirstHeartbeat =
-      options?.wasFirstHeartbeat ?? !existing.lastHeartbeatAt;
-
-    const runningCount = await countRunningRunsForAgent(agentId);
-    const nextStatus =
-      runningCount > 0
-        ? "running"
-        : outcome === "succeeded" ||
-            outcome === "interrupted" ||
-            outcome === "cancelled" ||
-            (outcome === "failed" && options?.keepIdleOnFailure)
-          ? "idle"
-          : "error";
-
-    const updated = await db
-      .update(agents)
-      .set({
-        status: nextStatus,
-        // Persist a human-readable reason on the agent record when it enters
-        // error so operators see it on the agent page without digging into run
-        // events; clear it whenever the agent leaves error.
-        errorReason:
-          nextStatus === "error"
-            ? truncateAgentErrorReason(failureReason)
-            : null,
-        lastHeartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(agents.id, agentId), eq(agents.lifecycleState, "ready")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-
-    if (isFirstHeartbeat && updated) {
-      const tc = getTelemetryClient();
-      if (tc)
-        trackAgentFirstHeartbeat(tc, {
-          agentRole: updated.role,
-          agentId: updated.id,
-        });
-    }
-
-    if (updated) {
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "agent.status",
-        payload: {
-          agentId: updated.id,
-          status: updated.status,
-          lastHeartbeatAt: updated.lastHeartbeatAt
-            ? new Date(updated.lastHeartbeatAt).toISOString()
-            : null,
-          outcome,
-        },
-      });
-    }
-  }
-
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
@@ -1808,6 +1743,13 @@ export function heartbeatService(
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
   ) {
+    return withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions));
+  }
+
+  async function executeRunAttempt(
+    runId: string,
+    runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim },
+  ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
@@ -1823,6 +1765,7 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
+    let legacyLocalAdapterEntered = false;
     let persistUsageCaptureFailure: (() => Promise<void>) | undefined;
     let run = await getRun(runId);
     if (!run) return;
@@ -1927,6 +1870,7 @@ export function heartbeatService(
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
     activeRunExecutions.add(run.id);
+    const timePreparation = createHeartbeatPreparationTiming(run.id);
     const executionControl = createAdapterExecutionControl();
     // This coarse scope also covers host finalization after the adapter returns.
     // Nested scopes refine the label without making any termination claim.
@@ -1947,6 +1891,23 @@ export function heartbeatService(
     let requiredWorkspaceRestoreEvidence: Record<string, unknown> | null = null;
     let providerResourceDispositionForRun:
       ProviderResourceDisposition | undefined;
+    const preserveNativeWorkspaceOnFailure = async () => {
+      const failureRun = await getRun(run.id);
+      if (failureRun?.runtimeMode === "native"
+        && parseObject(failureRun.runnerProfileJson?.nativeWorkspaceSync).state === "prepared") {
+        if (!nativeRunHasNoWorkspaceAccess(failureRun)) providerResourceDispositionForRun = "stop_and_retain";
+        try {
+          await preserveNativeFailedWorkspace(db, failureRun, {
+            allowPreterminal: true,
+            restartRecovery: runOptions.nativeRestartRecovery,
+          });
+        } catch (recoveryError) {
+          if (recoveryError instanceof NativeWorkspaceFinalizationBusyError) nativeOwnershipHeld = true;
+          else logger.error({ err: recoveryError, runId: run.id }, "failed to record retained native workspace recovery");
+        }
+      }
+      return !nativeOwnershipHeld;
+    };
     let nativeLifecycleTelemetryForRun:
       | {
           provider: string;
@@ -2148,7 +2109,7 @@ export function heartbeatService(
           await issuesSvc.checkout(
             issueId,
             agent.id,
-            ["todo", "backlog", "blocked"],
+            typeof context.workspaceReconstructionActionId === "string" ? ["todo"] : ["todo", "backlog", "blocked"],
             run.id,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
@@ -2241,9 +2202,11 @@ export function heartbeatService(
       const defaultIsolatedWorkspacesEnabled =
         isolatedWorkspacesEnabled &&
         experimentalInstanceSettings.enableIsolatedWorkspacesByDefault;
-      const [taskWorkspaceIntentRow] = issueId ? await db.select({ intent: issues.workspaceSelection }).from(issues)
+      const externalProvider = heartbeatExternalProvider({ run, agent });
+      const [taskWorkspaceIntentRow] = issueId && !externalProvider ? await db.select({ intent: issues.workspaceSelection }).from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId))) : [];
-      const runtimeWorkspaceSelectionEnabled = taskWorkspaceRuntimeSelectionEnabled({ legacyUiEnabled: isolatedWorkspacesEnabled, hasTypedSelection: Boolean(taskWorkspaceIntentRow?.intent), hasBinding: Boolean(issueContext?.executionWorkspaceId) });
+      const freshWorkspace = await readFreshWorkspaceReadiness(db, run);
+      const runtimeWorkspaceSelectionEnabled = !externalProvider && (freshWorkspace?.mode === "fresh_isolated_workspace" || taskWorkspaceRuntimeSelectionEnabled({ legacyUiEnabled: isolatedWorkspacesEnabled, hasTypedSelection: Boolean(taskWorkspaceIntentRow?.intent), hasBinding: Boolean(issueContext?.executionWorkspaceId) }));
       const parsedIssueExecutionWorkspaceSettings =
         parseIssueExecutionWorkspaceSettings(
           issueContext?.executionWorkspaceSettings,
@@ -2257,9 +2220,9 @@ export function heartbeatService(
           runtimeWorkspaceSelectionEnabled,
         );
       const contextProjectId = readNonEmptyString(context.projectId);
-      const boundSourceWorkspace = issueContext?.executionWorkspaceId
-        ? await executionWorkspacesSvc.getById(issueContext.executionWorkspaceId) : null;
-      const [selectedWorkspaceSource] = !boundSourceWorkspace && issueContext?.projectWorkspaceId
+      const boundSourceWorkspace = !externalProvider && issueContext?.executionWorkspaceId
+        ? await executionWorkspacesSvc.getStoredById(agent.companyId, issueContext.executionWorkspaceId) : null;
+      const [selectedWorkspaceSource] = !externalProvider && !boundSourceWorkspace && issueContext?.projectWorkspaceId
         ? await db.select({ projectId: projectWorkspaces.projectId }).from(projectWorkspaces)
           .where(and(eq(projectWorkspaces.id, issueContext.projectWorkspaceId), eq(projectWorkspaces.companyId, agent.companyId))) : [];
       const loadProjectContext = async (projectId: string | null | undefined) => projectId
@@ -2291,14 +2254,14 @@ export function heartbeatService(
         : null;
       const taskProjectId = issueContext ? issueContext.projectId : contextProjectId;
       const taskProjectContext = await loadProjectContext(taskProjectId);
-      const executionProjectId = boundSourceWorkspace ? boundSourceWorkspace.projectId
+      const executionProjectId = externalProvider ? null : boundSourceWorkspace ? boundSourceWorkspace.projectId
         : taskWorkspaceIntentRow?.intent?.selection.kind === "task_directory" ? null
           : selectedWorkspaceSource?.projectId ?? (taskProjectContext?.hasWorkspace ? taskProjectId : null);
       if (issueContext) {
         if (taskProjectId) context.projectId = taskProjectId;
         else delete context.projectId;
       }
-      const workspaceProjectContext = executionProjectId === taskProjectId
+      const workspaceProjectContext = externalProvider ? null : executionProjectId === taskProjectId
         ? taskProjectContext : await loadProjectContext(executionProjectId);
       const acceptedPlanContinuationWake = issueContext && !isConversation(issueContext)
         ? readNonEmptyString(context.workspaceRefreshReason) ===
@@ -2463,9 +2426,15 @@ export function heartbeatService(
             taskKey,
           )
         : null;
-      const routerHasPersistedInput = Object.keys(parseObject(parseObject(run.runnerProfileJson).nativeExecutionInput)).length > 0;
+      const savedRouterInput = parseObject(parseObject(run.runnerProfileJson).nativeExecutionInput);
+      const routerHasPersistedInput = Object.keys(savedRouterInput).length > 0;
+      if (agent.adapterType === "paperclip_runner") {
+        const homeConfig = bindHeartbeatRunnerHomeMode(config, savedRouterInput);
+        if ("homeMode" in homeConfig) config = { ...config, homeMode: homeConfig.homeMode };
+      }
       const persistedRouterPoolId = routerHasPersistedInput ? readNonEmptyString(parseObject(context.aiRouterSelection).poolId) : null;
-      const requestedAiBinding = persistedRouterPoolId ? { mode: "router" as const, connectionId: persistedRouterPoolId } : agent.runtimeConfig?.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
+      const preconfiguredHome = agent.adapterType === "paperclip_runner" && config.homeMode === "preconfigured";
+      const requestedAiBinding = preconfiguredHome ? undefined : persistedRouterPoolId ? { mode: "router" as const, connectionId: persistedRouterPoolId } : agent.runtimeConfig?.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
       let aiBinding = requestedAiBinding?.mode === "router" ? undefined : requestedAiBinding;
       const originalAiIssueOverrides = issueAssigneeOverrides;
       if (requestedAiBinding?.mode === "router") {
@@ -2550,8 +2519,8 @@ export function heartbeatService(
         legacyUseProjectWorkspace:
           issueAssigneeOverrides?.useProjectWorkspace ?? null,
       });
-      const requestedExecutionWorkspaceMode =
-        trustPreset.kind === "low_trust_review" &&
+      const requestedExecutionWorkspaceMode = freshWorkspace?.mode === "fresh_isolated_workspace"
+        ? "isolated_workspace" : trustPreset.kind === "low_trust_review" &&
         resolvedExecutionWorkspaceMode === "shared_workspace"
           ? "isolated_workspace"
           : resolvedExecutionWorkspaceMode;
@@ -2568,9 +2537,8 @@ export function heartbeatService(
             description: issueContext.description,
             projectId: issueContext.projectId,
             projectWorkspaceId: issueContext.projectWorkspaceId,
-            executionWorkspaceId: issueContext.executionWorkspaceId,
-            executionWorkspacePreference:
-              issueContext.executionWorkspacePreference,
+            executionWorkspaceId: freshWorkspace?.mode === "fresh_isolated_workspace" ? null : issueContext.executionWorkspaceId,
+            executionWorkspacePreference: freshWorkspace?.mode === "fresh_isolated_workspace" ? "create_new" : issueContext.executionWorkspacePreference,
           }
         : null;
       const storedLedgerScope = parseObject(parseObject(run.usageJson).ledgerScope);
@@ -2585,7 +2553,7 @@ export function heartbeatService(
       } = await prepareHeartbeatTaskContext(db, {
         run, agent,
         task: { issueRef, issueContext, wakeCommentContext, context, taskSession },
-        policy: { trustPreset, experimentalInstanceSettings },
+        policy: { trustPreset, experimentalInstanceSettings, recovering: Boolean(runOptions.nativeRestartRecovery || runOptions.nativeLeaseOwner) },
         services: { issuesSvc, getPinnedSkillTestContext },
       });
       const sourceWorkspaceConfig = buildExecutionWorkspaceAdapterConfig({
@@ -2622,34 +2590,34 @@ export function heartbeatService(
         materializeNativeChatWorktree,
         explicitTaskDirectory,
         useIsolatedTaskDirectory,
-      } = await selectHeartbeatEnvironment(db, {
+      } = await timePreparation("environment_selection", () => selectHeartbeatEnvironment(db, {
         run, agent,
         task: { issueRef, issueContext, issueId, context, executionProjectId, workspaceProjectContext, boundSourceWorkspace,
-          hasSelectedWorkspaceSource: Boolean(selectedWorkspaceSource), taskWorkspaceIntent: taskWorkspaceIntentRow?.intent ?? null, responsibleUserId },
+          freshWorkspace, hasSelectedWorkspaceSource: Boolean(selectedWorkspaceSource), taskWorkspaceIntent: taskWorkspaceIntentRow?.intent ?? null, responsibleUserId },
         policy: {
           trustPreset, requestedExecutionWorkspaceMode, isolatedWorkspacesEnabled: runtimeWorkspaceSelectionEnabled,
           projectExecutionWorkspacePolicy, issueExecutionWorkspaceSettings,
         },
         config: { config, sourceWorkspaceConfig, issueAssigneeOverrides },
-        services: { executionWorkspacesSvc, environmentsSvc, instanceSettings, findSharedWorkspaceHolder },
-      });
+        services: { executionWorkspacesSvc, environmentsSvc, instanceSettings, findSharedWorkspaceHolder, findExecutionWorkspaceHolder },
+      }));
       let nativeChatExpectedCwd = selectedNativeChatExpectedCwd;
-      const executionConfiguration = await prepareHeartbeatExecutionConfiguration(db, {
+      const executionConfiguration = await timePreparation("execution_configuration", () => prepareHeartbeatExecutionConfiguration(db, {
         run, agent,
         task: { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext },
         config: { sourceWorkspaceConfig, aiBinding },
         policy: { trustPreset, useIsolatedTaskDirectory, explicitTaskDirectory },
         environment: { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput },
         services: { secretsSvc, companySkills, appendRunEvent, finalizeAiConnectionBusyDeferral },
-        onFailureSecretsResolved: (readSecrets) => { readFailureReportSecrets = readSecrets; },
+        onFailureSecretsResolved: (readSecrets) => { readFailureReportSecrets = () => [...readSecrets(), ...identityRedactor.values]; },
         onManagedAiRuntimeAcquired: (runtime) => { managedAiRuntime = runtime; },
         onIdentityRedactorPrepared: (redactor) => { identityRedactor = redactor; },
-      });
+      }));
       if (!executionConfiguration.prepared) return;
       const {
         mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
         resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
-        runtimeSkillEntries, nativeRunnerPreparationSpans, agentIdentity,
+        runtimeSkillEntries, nativeRunnerPreparationSpans, agentIdentity, observability,
       } = executionConfiguration;
       let { runtimeConfig } = executionConfiguration;
       const resolvedFailureSecrets = readFailureReportSecrets();
@@ -2658,7 +2626,7 @@ export function heartbeatService(
         ...identityRedactor.values,
         ...collectRunFailureSecretValues(runtimeConfig.env, secretKeys),
       ];
-      const preparedSession = await prepareHeartbeatSession(db, {
+      const preparedSession = await timePreparation("session", () => prepareHeartbeatSession(db, {
         run, agent,
         task: { context, issueRef, issueContext, taskProjectContext, workspaceProjectContext, wakeCommentId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision },
         session: { taskSession, taskSessionDecodedParams, explicitResumeSessionParams, explicitResumeSessionDisplayId, sessionCodec },
@@ -2672,7 +2640,7 @@ export function heartbeatService(
         },
         environment: { environmentResolution, selectedEnvironmentId, selectedEnvironmentForConfig },
         getLatestAgentConfigRevision,
-      });
+      }));
       const { sessionConfigMetadata, configuredModel, resetTaskSession, sessionResetReason, taskSessionForRun, getFreshSessionHandoff, previousSessionParams } = preparedSession;
       const {
         resolvedWorkspace,
@@ -2694,7 +2662,7 @@ export function heartbeatService(
         workspaceRealization,
         executionTarget,
         workspaceRestoreSource,
-      } = await prepareHeartbeatWorkspace(db, {
+      } = await timePreparation("workspace", () => prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans,
         task: {
           issueRef,
@@ -2703,6 +2671,7 @@ export function heartbeatService(
           responsibleUserId,
           previousSessionParams,
           workspaceSelection: taskWorkspaceIntentRow?.intent ?? null,
+          freshWorkspace,
         },
         policy: {
           trustPreset,
@@ -2739,6 +2708,7 @@ export function heartbeatService(
           runOptions,
         },
         services: {
+          workspaceWorkers: options.pluginWorkerManager,
           envOrchestrator,
           executionWorkspacesSvc,
           workspaceOperationsSvc,
@@ -2746,8 +2716,9 @@ export function heartbeatService(
           resolveReusedGitWorkspaceAnchor,
           appendRunEvent,
         },
-      });
+      }));
       const preparedInstructions = instructionWorkingCopy = createHeartbeatInstructionWorkingCopy({
+        observabilityCompatibilityKey: observability?.compatibilityKey,
         db, instructionCopies, readRun: () => run!, agent, context,
         session: { taskSession, taskSessionForRun, sessionConfigMetadata },
         workspace: { executionTarget, executionWorkspace, persistedExecutionWorkspace },
@@ -2809,6 +2780,7 @@ export function heartbeatService(
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
+            typeof context.workspaceReconstructionActionId !== "string" &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };
@@ -2844,8 +2816,9 @@ export function heartbeatService(
       ) => {
         // Admission can wait for accounting locks. Finish that wait before the
         // final ownership gate, whose callback must enter the adapter directly.
-        const reservation = await reserveRunBudget(db, run.companyId, run.id,
-          readNonEmptyString(runLedgerScope.projectId), runLedgerScope, runOptions.nativeLeaseOwner);
+        const reservation = await measureRunPhase("execution.budget_reservation", () =>
+          reserveRunBudget(db, run.companyId, run.id,
+            readNonEmptyString(runLedgerScope.projectId), runLedgerScope, runOptions.nativeLeaseOwner));
         let entered = false;
         try {
           return await dispatchResolvedInteractionContinuationAfterAdmission((markDispatchStarted) => {
@@ -2907,7 +2880,10 @@ export function heartbeatService(
       } else {
         delete context.paperclipScratch;
       }
-      const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
+      if (issueId && (!executionTarget || executionTarget.kind === "local")) {
+        await recordLegacyCaseHandoffCleanupIntent(db, { runId: run.id, issueId, controllerBootId: legacyControllerBootId, scratch: runScratch });
+      }
+      const gitExecutionEnv = await timePreparation("github_environment", () => prepareGitHubExecutionEnvironment({
         target: executionTarget,
         cwd: executionWorkspace.cwd,
         env: Object.fromEntries(
@@ -2921,12 +2897,12 @@ export function heartbeatService(
         networkAccess:
           trustPreset.kind === "standard" &&
           process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-      });
+      }));
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
       if (!useHostGitHub) {
-        const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
+        const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
           githubConfigured: githubSelection.configured,
           agentId: agent.id,
@@ -2942,7 +2918,7 @@ export function heartbeatService(
             responsibleUserId: responsibleUserId ?? "",
             scope: "github_credentials",
           })?.token ?? "",
-        });
+        }));
         githubLauncherLocation = githubLaunchers.cleanupLocation;
         runtimeConfig = { ...runtimeConfig, env: githubLaunchers.env };
         secretKeys.add("PAPERCLIP_GITHUB_BROKER_TOKEN");
@@ -3173,7 +3149,7 @@ export function heartbeatService(
         });
 
         const { currentUserRedactionOptions, appendIdentityRedactedLog, onLog, onAdapterMeta, onAdapterEvent } =
-          await runOutput.begin(currentRun);
+          await timePreparation("run_output", () => runOutput.begin(currentRun));
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
             "stdout",
@@ -3184,7 +3160,7 @@ export function heartbeatService(
           const logEntry = formatRuntimeWorkspaceWarningLog(warning);
           await onLog(logEntry.stream, logEntry.chunk);
         }
-        await assertGitSensitiveAdapterWorkspaceValid({
+        await timePreparation("workspace_validation", () => assertGitSensitiveAdapterWorkspaceValid({
           adapterType: agent.adapterType,
           agentId: agent.id,
           issue: issueRef
@@ -3201,17 +3177,17 @@ export function heartbeatService(
           executionTarget,
           environmentDriver: selectedEnvironment.driver,
           leaseMetadata: activeEnvironmentLease.lease.metadata,
-        });
+        }));
         const adapterEnv = Object.fromEntries(
           Object.entries(parseObject(runtimeConfig.env)).filter(
             (entry): entry is [string, string] =>
               typeof entry[0] === "string" && typeof entry[1] === "string",
           ),
         );
-        const runtimeServices = await startHeartbeatRuntimeServices(db, {
+        const runtimeServices = await timePreparation("runtime_services", () => startHeartbeatRuntimeServices(db, {
           run, agent, issueId, issueRef, executionWorkspace, context, issuesSvc, onLog,
           persistedExecutionWorkspace, hostExecutionWorkspaceConfig, skipHostProvision, adapterEnv, workspaceOperationRecorder,
-        });
+        }));
         const adapter = getServerAdapter(agent.adapterType);
         const durableGoalControlRun =
           readNonEmptyString(context.goalControlRequestId) !== null ||
@@ -3241,6 +3217,8 @@ export function heartbeatService(
           persisted: run,
           enabled:
             resolvedInstanceSettings.experimental.enableNativeRunner === true,
+          museEnabled: resolvedInstanceSettings.experimental.enableMuse === true,
+          grokEnabled: resolvedInstanceSettings.experimental.enableGrokBot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
           dotEnabled: resolvedInstanceSettings.experimental.enableOpenAiDot === true
             && resolvedInstanceSettings.experimental.enablePublicMcp === true,
           runtimeConfig: agent.runtimeConfig,
@@ -3256,9 +3234,9 @@ export function heartbeatService(
         });
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
-          : !["claude_managed_agents_api", "aws_agentcore_harness_api", "openai_dot_mcp"].includes(nativeRuntimeResolution.profile.backend);
-        runtimeConfig = await preparedInstructions.prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem });
-        const runtimeSelection = await selectHeartbeatRuntime(db, {
+          : nativeRuntimeHasInstructionFilesystem(nativeRuntimeResolution.profile.backend);
+        runtimeConfig = await timePreparation("instructions", () => preparedInstructions.prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem }));
+        const runtimeSelection = await timePreparation("runtime_selection", () => selectHeartbeatRuntime(db, {
           run,
           agent,
           nativeRuntimeResolution,
@@ -3293,10 +3271,11 @@ export function heartbeatService(
                 message: "workspace_checkpoint", payload: { phase: "workspace_checkpoint", ...metrics } });
             },
             onPhase: async (name, work) => {
+              if (isWorkspaceSyncDetailPhase(name)) return measureWorkspaceSyncPhase(name, work);
               const started = Date.now();
-              try { return await work(); }
-              finally { await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
-                message: name, payload: { phase: name, durationMs: Date.now() - started } }); }
+              try { return await measureWorkspaceSyncPhase(name, work); }
+              finally { await measureRunPhase("workspace_sync.progress", () => appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
+                message: name, payload: { phase: name, durationMs: Date.now() - started } })); }
             },
           },
           config: {
@@ -3325,11 +3304,11 @@ export function heartbeatService(
             nativeOwnershipHeld = true;
           },
           stopControllerLease: () => controllerLease.stop(),
-        });
+        }));
         if (!runtimeSelection.selected) return;
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
-        const execution = await executeHeartbeatRuntime(db, {
+        const execution = await measureRunPhase("execution.runtime", () => executeHeartbeatRuntime(db, {
           run, agent, options,
           task: {
             issueRef,
@@ -3365,6 +3344,7 @@ export function heartbeatService(
             configuredTaskEnvironment,
             adapterEnv,
             agentIdentity,
+            observability,
             managedAiRuntime,
             runtimeEnv,
             useHostGitHub,
@@ -3412,21 +3392,39 @@ export function heartbeatService(
             getRun,
             cancelRunInternal,
             enqueueWakeup,
-            persistRunProcessMetadata,
+            persistRunProcessMetadata: async (processRunId, meta) => {
+              if (!issueId || (executionTarget && executionTarget.kind !== "local")) {
+                return persistRunProcessMetadata(processRunId, meta);
+              }
+              // Bind cleanup intent to this exact process generation in the
+              // same commit as its host-observed PID/group/start identity.
+              return db.transaction(async transaction => {
+                const tx = transaction as unknown as Db;
+                const persisted = await persistHeartbeatRunProcessMetadata(tx, processRunId, meta);
+                await recordLegacyCaseHandoffCleanupIntent(tx, { runId: processRunId, issueId,
+                  controllerBootId: legacyControllerBootId, scratch: runScratch });
+                return persisted;
+              });
+            },
             recordCurrentHeartbeatRunRuntimeProgress,
             dispatchPendingNativeStatusWakeups,
           },
           effects: {
             onUsageCaptureReady: (value) => { persistUsageCaptureFailure = value; },
             onNativeDispatchStarted: () => { nativeDispatchStarted = true; },
-            onLegacyAdapterEntered: () => { legacyAdapterEntered = true; },
+            onLegacyAdapterEntered: () => {
+              legacyAdapterEntered = true;
+              legacyLocalAdapterEntered = legacyAdapterNeedsLocalProcessSettlement({
+                adapterType: adapter.type, executionTargetKind: executionTarget?.kind,
+              });
+            },
             onNativeWorkspaceFinalizeScheduled: () => { nativeWorkspaceFinalizeScheduled = true; },
             onNativeSessionResumeScheduled: () => { nativeSessionResumeScheduled = true; },
             onNativeOwnershipHeld: () => { nativeOwnershipHeld = true; },
             onProviderResourceDisposition: (value) => { providerResourceDispositionForRun = value; },
             onWorkspaceRestoreFailure: (evidence) => { requiredWorkspaceRestoreEvidence = evidence; },
           },
-        });
+        }));
         if (!execution.dispatched) return;
         const { adapterResult } = execution;
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced
@@ -3469,7 +3467,7 @@ export function heartbeatService(
           run, agent, issueId, issueRef, executionWorkspace, context, issuesSvc, onLog,
           adapterResult, runtimeServices,
         });
-        await runCompletion.completeRun({
+        await measureRunPhase("completion.run", () => runCompletion.completeRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
           output: runOutput,
           session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
@@ -3479,7 +3477,7 @@ export function heartbeatService(
           providerTraceCapture: providerTraceCapture !== null,
           onProviderTraceFinalized: () => { providerTraceFinalized = true; },
           issueContext, onLog,
-        });
+        }));
       } catch (err) {
         await persistUsageCaptureFailure?.();
         if (err instanceof NativeControllerDetachedForRestartError) {
@@ -3496,6 +3494,7 @@ export function heartbeatService(
           return;
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
+          await preserveNativeWorkspaceOnFailure();
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
@@ -3600,6 +3599,7 @@ export function heartbeatService(
           }
           return;
         }
+        if (!(await preserveNativeWorkspaceOnFailure())) return;
         await runCompletion.failRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
           output: runOutput,
@@ -3646,11 +3646,15 @@ export function heartbeatService(
           },
         );
       } else {
-        await runCompletion.failRunSetup({
-          run, runId, outerErr, identityRedactor, readFailureReportSecrets,
+        await preserveNativeWorkspaceOnFailure();
+        if (!nativeOwnershipHeld) await runCompletion.failRunSetup({
+          run, runId, outerErr, signal: executionControl.controller.signal,
+          providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted,
+          identityRedactor, readFailureReportSecrets,
         });
       }
     } finally {
+      let caseHandoffCleanupSettled = false;
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
@@ -3757,6 +3761,7 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          caseHandoffCleanupSettled = true;
         }
         if (
           runScratch &&
@@ -3772,8 +3777,12 @@ export function heartbeatService(
               scratch: scratchForCleanup,
               processGroupId: latestRun.processGroupId,
               isProcessGroupAlive,
+              beforeRemove: caseHandoffCleanupSettled && latestRun.runtimeMode === "legacy"
+                ? () => recordLegacyCaseHandoffCleanupVerified(db, { runId: run.id, controllerBootId: legacyControllerBootId, scratch: scratchForCleanup })
+                : undefined,
             });
           } catch (scratchCleanupError) {
+            caseHandoffCleanupSettled = false;
             logger.warn(
               {
                 err: scratchCleanupError,
@@ -3797,6 +3806,9 @@ export function heartbeatService(
             }).catch(() => undefined);
           }
           if (scratchCleanup) {
+            // Scratch cleanup verifies the owned process group, including
+            // grandchildren. The main adapter's exit is not this proof.
+            if (!scratchCleanup.removed) caseHandoffCleanupSettled = false;
             await appendRunEvent(latestRun, {
               eventType: "lifecycle",
               stream: "system",
@@ -3857,6 +3869,17 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+      }
+      if (latestRun) await reconcileMuseNativeTerminalRun(db, latestRun);
+      // Scratch preparation is optional. Its removal cannot be the only proof
+      // that a local legacy adapter's closed-stdio descendants stopped.
+      if (caseHandoffCleanupSettled && latestRun?.runtimeMode === "legacy" && legacyLocalAdapterEntered) {
+        caseHandoffCleanupSettled = hasStoppedLocalProcessTree(latestRun);
+      }
+      if (caseHandoffCleanupSettled && latestRun && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled &&
+          !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        const handoff = await pendingCaseHandoffForRun(db, run.id);
+        if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
@@ -4081,6 +4104,7 @@ export function heartbeatService(
 
     releaseEnvironmentLeasesForRun,
     resumeRemoteStopComments,
+    resumeTaskRetry: runControl.resumeTaskRetry,
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
 
@@ -4093,6 +4117,7 @@ export function heartbeatService(
     reconcileTaskWatchdogs,
     reconcileCostAccounting: async () => {
       await decisionModelService(db, { budgetHooks }).recoverInterrupted();
+      await promptInjectionPreventionService(db, { budgetHooks }).recoverInterrupted();
       return createCostAccountingReconciler(db, budgetHooks)();
     },
 
@@ -4102,6 +4127,20 @@ export function heartbeatService(
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
+
+    requestCaseHandoffYield: async (input: { runId: string; issueId: string; handoffId: string }) => {
+      const handoff = await pendingCaseHandoffForRun(db, input.runId);
+      if (!handoff || handoff.id !== input.handoffId || handoff.issueId !== input.issueId || handoff.state !== "awaiting_release") return;
+      // Native tool-result observation parks the turn. Legacy adapters are told
+      // to end it. Never stop synchronously inside the caller's own tool request.
+      if (Date.now() - handoff.createdAt.getTime() < 30_000) return;
+      const source = await getRun(input.runId);
+      if (!source || !["queued", "running"].includes(source.status)) return;
+      await cancelRunInternal(source.id, "Yielding the task to its next case phase", {
+        errorCode: "issue_reassigned", suppressImmediateRecovery: true,
+        resultJson: { caseHandoffYieldStop: true, reassignmentStopConfirmed: true, caseHandoffId: handoff.id },
+      });
+    },
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the

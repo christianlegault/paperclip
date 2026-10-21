@@ -71,6 +71,8 @@ export { routines, routineRevisions, routineTriggers, routineWebhookTestReceipts
 export { pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
 export {
   cases,
+  caseHandoffs,
+  caseAccessSources,
   caseAttachments,
   caseDocuments,
   caseEvents,
@@ -227,6 +229,7 @@ export { browserUseSettings, browserUseSessions, browserUseRuns, browserUseBrows
 export * from "./company_skill_sources.js";
 export * from "./public_mcp.js";
 export * from "./dot_runner.js";
+export * from "./grok_bot.js";
 
 
 export * from "./accounting.js";
@@ -246,8 +249,12 @@ export { userCompanyPreferences } from "./user_company_preferences.js";
 
 export { chatSlackManagerGrants } from "./chat_slack_manager_grants.js";
 export { aiSubscriptions, aiSubscriptionPrices, aiSubscriptionConnections } from "./ai_subscriptions.js";
+export * from "./muse_runner.js";
 
 export { executionWorkspaceRepositories } from "./execution_workspace_repositories.js";
 export { executionWorkspaceRepositoryRoots } from "./execution_workspace_repository_roots.js";
 export { executionWorkspaceRepositoryAccess } from "./execution_workspace_repository_access.js";
 export * from "./fast_responses.js";
+export { companyObservability } from "./company_observability.js";
+
+export * from "./prompt_injection_prevention.js";

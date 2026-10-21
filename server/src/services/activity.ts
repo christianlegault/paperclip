@@ -1,3 +1,4 @@
+import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -29,6 +30,7 @@ export interface ActivityFilters {
   entityId?: string;
   limit?: number;
   readCondition?: SQL<boolean>;
+  caseReadCondition?: SQL<boolean>;
 }
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
@@ -354,8 +356,9 @@ export function activityService(db: Db) {
   }
 
   return {
-    list: (filters: ActivityFilters) => {
-      const conditions = [eq(activityLog.companyId, filters.companyId)];
+    list: async (filters: ActivityFilters) => {
+      const conditions = [eq(activityLog.companyId, filters.companyId), await skillAccessService(db).activityCondition(filters.companyId),
+        filters.caseReadCondition ?? sql<boolean>`${activityLog.entityType} <> 'case'`];
       const limit = normalizeActivityLimit(filters.limit);
 
       if (filters.agentId) {
@@ -411,6 +414,7 @@ export function activityService(db: Db) {
         .select({
           runId: heartbeatRuns.id,
           runtimeMode: heartbeatRuns.runtimeMode,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
           status: heartbeatRuns.status,
           agentId: heartbeatRuns.agentId,
           adapterType: agents.adapterType,
@@ -439,6 +443,7 @@ export function activityService(db: Db) {
           lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
           nextAction: heartbeatRuns.nextAction,
           wakeCommentIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds'`,
+          queuedCommentSourceWakeIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'queuedCommentSourceWakeIds'`,
           wakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
           contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
           contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
@@ -584,7 +589,7 @@ export function activityService(db: Db) {
       });
     },
 
-    issuesForRun: async (runId: string) => {
+    issuesForRun: async (runId: string, readCondition: SQL<boolean>) => {
       const run = await db
         .select({
           companyId: heartbeatRuns.companyId,
@@ -610,7 +615,9 @@ export function activityService(db: Db) {
             eq(activityLog.companyId, run.companyId),
             eq(activityLog.runId, runId),
             eq(activityLog.entityType, "issue"),
+            eq(issues.companyId, run.companyId),
             visibleIssueCondition(),
+            readCondition,
           ),
         )
         .orderBy(issueIdAsText);
@@ -633,6 +640,7 @@ export function activityService(db: Db) {
             eq(issues.companyId, run.companyId),
             eq(issues.id, contextIssueId),
             visibleIssueCondition(),
+            readCondition,
           ),
         )
         .then((rows) => rows[0] ?? null);
