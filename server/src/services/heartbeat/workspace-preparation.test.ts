@@ -185,6 +185,57 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect((await readIssue(issue.id)).executionWorkspaceId).toBe(prepared.persistedExecutionWorkspace!.id);
   });
 
+  async function freshTaskDirectoryThenNextTurn(lowTrustTaskDirectory: boolean) {
+    // A projectless task whose isolated mode is configured to build Git worktrees.
+    const { input, source, issue } = await fixture(true);
+    await db.update(issues).set({ projectId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+    input.task.issueRef = { ...issue, projectId: null, projectWorkspaceId: null };
+    input.task.context = { issueId: issue.id };
+    input.policy.useIsolatedTaskDirectory = true;
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    const fresh = await prepareHeartbeatWorkspace(db, input);
+    await writeFile(join(fresh.executionWorkspace.cwd, "notes.md"), "fresh attempt work\n");
+    const bound = await readIssue(issue.id);
+    expect(bound).toMatchObject({ executionWorkspaceId: fresh.persistedExecutionWorkspace!.id,
+      executionWorkspacePreference: "reuse_existing", executionWorkspaceSettings: { mode: "isolated_workspace" } });
+
+    // The next ordinary turn is admitted from the persisted binding, not as a fresh retry.
+    input.task.freshWorkspace = null;
+    input.task.issueRef = bound;
+    input.policy.useIsolatedTaskDirectory = lowTrustTaskDirectory;
+    input.policy.issueExecutionWorkspaceSettings = { mode: "isolated_workspace" };
+    await reuse(input, fresh.persistedExecutionWorkspace!);
+    const next = await prepareHeartbeatWorkspace(db, input);
+    expect(next.executionWorkspace.cwd).toBe(fresh.executionWorkspace.cwd);
+    expect(next.persistedExecutionWorkspace!.id).toBe(fresh.persistedExecutionWorkspace!.id);
+    expect(await readFile(join(next.executionWorkspace.cwd, "notes.md"), "utf8")).toBe("fresh attempt work\n");
+    expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(fresh.persistedExecutionWorkspace!.id);
+  }
+
+  it("continues a fresh task directory on the next turn instead of validating it as a Git worktree base", async () => {
+    await freshTaskDirectoryThenNextTurn(false);
+  });
+
+  it("continues a fresh low-trust task directory on the next turn instead of reopening the retained root", async () => {
+    await freshTaskDirectoryThenNextTurn(true);
+  });
+
+  it("still requires a Git base when a reused non-task directory is configured for Git worktrees", async () => {
+    const { input, issue } = await fixture(true);
+    const cwd = join(home, "operator-directory");
+    await mkdir(cwd, { recursive: true });
+    const workspace = await executionWorkspaceService(db).create({ companyId: issue.companyId, projectId: null,
+      sourceIssueId: issue.id, name: "Operator directory", mode: "isolated_workspace", strategyType: "project_primary", cwd });
+    input.task.issueRef = { ...issue, projectId: null, projectWorkspaceId: null };
+    input.task.context = { issueId: issue.id };
+    await reuse(input, workspace!);
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      resultJson: { workspaceValidation: { reason: "git_worktree_base_not_git_checkout" } },
+    });
+  });
+
   async function reuse(input: HeartbeatWorkspacePreparationInput, workspace: NonNullable<Awaited<ReturnType<typeof prepareHeartbeatWorkspace>>["persistedExecutionWorkspace"]>) {
     input.reuse.requestedShouldReuseExisting = true;
     input.reuse.existingExecutionWorkspace = workspace;

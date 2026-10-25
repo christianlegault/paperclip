@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { materializeIsolatedTaskDirectory, shouldUseIsolatedTaskDirectory } from "./isolated-task-directory.js";
+import { materializeIsolatedTaskDirectory, resolveIsolatedTaskDirectoryIdentity, shouldUseIsolatedTaskDirectory } from "./isolated-task-directory.js";
 import { prepareSandboxManagedRuntime, type SandboxManagedRuntimeClient, type SandboxSyncOperation } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 
 const execFile = promisify(execFileCallback);
@@ -125,5 +125,37 @@ describe("isolated task directories", () => {
     const identity = await setup();
     await expect(materializeIsolatedTaskDirectory({ ...identity, issueId: "../outside" }))
       .rejects.toThrow("Invalid isolated task workspace identity");
+  });
+
+  it("recognizes only this task's own retained or fresh-attempt directory as a task directory", async () => {
+    const identity = await setup();
+    const task = { companyId: identity.companyId, issueId: identity.issueId };
+    const workspace = (cwd: string, override: Record<string, unknown> = {}) => ({
+      companyId: identity.companyId, sourceIssueId: identity.issueId, mode: "isolated_workspace",
+      strategyType: "project_primary", projectWorkspaceId: null, repoUrl: null, branchName: null, cwd, ...override,
+    });
+    const retained = await materializeIsolatedTaskDirectory(identity);
+    const attempt = await materializeIsolatedTaskDirectory({ ...identity, attemptId: "run-1" });
+    expect(await resolveIsolatedTaskDirectoryIdentity(workspace(retained), task)).toEqual({});
+    expect(await resolveIsolatedTaskDirectoryIdentity(workspace(attempt), task)).toEqual({ attemptId: "run-1" });
+    expect(await materializeIsolatedTaskDirectory({ ...identity, attemptId: "run-1" })).toBe(attempt);
+
+    const otherIssue = await materializeIsolatedTaskDirectory({ ...identity, issueId: "issue-2", attemptId: "run-1" });
+    const otherCompany = await materializeIsolatedTaskDirectory({ ...identity, companyId: "company-2" });
+    for (const [cwd, override] of [
+      [otherIssue, {}],
+      [otherCompany, {}],
+      [path.join(attempt, "nested"), {}],
+      [root!, {}],
+      [attempt, { sourceIssueId: "issue-2" }],
+      [attempt, { companyId: "company-2" }],
+      [attempt, { strategyType: "git_worktree" }],
+      [attempt, { mode: "shared_workspace" }],
+      [attempt, { repoUrl: "https://github.com/example/repo.git" }],
+      [attempt, { projectWorkspaceId: "workspace-1" }],
+      [attempt, { branchName: "feature" }],
+    ] as const) {
+      expect(await resolveIsolatedTaskDirectoryIdentity(workspace(cwd, override), task)).toBeNull();
+    }
   });
 });

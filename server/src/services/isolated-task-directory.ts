@@ -21,6 +21,40 @@ export function shouldUseIsolatedTaskDirectory(input: {
     && input.workspaceStrategies.every((value) => Object.keys(parseObject(value)).length === 0);
 }
 
+/**
+ * Identifies a persisted execution workspace as this task's own isolated task
+ * directory: the retained root (`{}`) or a fresh-attempt sibling (`{ attemptId }`).
+ * Such a directory has no Git base, so later turns must keep using it as a plain
+ * task directory. Returns null for any other workspace.
+ */
+export async function resolveIsolatedTaskDirectoryIdentity(
+  workspace: {
+    companyId: string;
+    sourceIssueId: string | null;
+    mode: string;
+    strategyType: string;
+    projectWorkspaceId: string | null;
+    repoUrl: string | null;
+    branchName: string | null;
+    cwd: string | null;
+  },
+  task: { companyId: string; issueId: string },
+): Promise<{ attemptId?: string } | null> {
+  if (workspace.companyId !== task.companyId || workspace.sourceIssueId !== task.issueId ||
+      workspace.mode !== "isolated_workspace" || workspace.strategyType !== "project_primary" ||
+      workspace.projectWorkspaceId || workspace.repoUrl || workspace.branchName || !workspace.cwd) {
+    return null;
+  }
+  if ([task.companyId, task.issueId].some((value) => !/^[a-zA-Z0-9_-]+$/.test(value))) return null;
+  const configuredRoot = resolvePaperclipInstanceRoot();
+  const root = await realpath(configuredRoot).catch(() => path.resolve(configuredRoot));
+  const cwd = path.resolve(workspace.cwd);
+  if (cwd === path.join(root, "isolated-workspaces", task.companyId, task.issueId)) return {};
+  const attemptId = path.basename(cwd);
+  return path.dirname(cwd) === path.join(root, "isolated-workspace-attempts", task.companyId, task.issueId) &&
+    /^[a-zA-Z0-9_-]+$/.test(attemptId) ? { attemptId } : null;
+}
+
 /** Stable across turns, separate from project roots and shared agent homes. */
 export async function materializeIsolatedTaskDirectory(input: {
   companyId: string;

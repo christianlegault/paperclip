@@ -36,7 +36,7 @@ import { createGitRemoteAuthProvider } from "../git-credentials.js";
 import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
-import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
+import { materializeIsolatedTaskDirectory, resolveIsolatedTaskDirectoryIdentity } from "../isolated-task-directory.js";
 import { withIsolatedRepositorySourceLock } from "../isolated-remote-workspace-source.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
@@ -207,6 +207,13 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   // It is not a repository source and must not pass through Git copy admission.
   const freshNeedsSeed = fresh && !isDotRun && !useIsolatedTaskDirectory &&
     !(nativeChatWorkspaceScope && !nativeChatWorkspaceScope.projectId);
+  // A later turn reusing the task's own clean directory (often a fresh-attempt
+  // sibling) keeps the directory transport that created it; it has no Git base.
+  const reusedTaskDirectory = !fresh && !isDotRun && issueRef && requestedShouldReuseExisting &&
+    reusableExistingExecutionWorkspace
+    ? await resolveIsolatedTaskDirectoryIdentity(reusableExistingExecutionWorkspace,
+      { companyId: agent.companyId, issueId: issueRef.id })
+    : null;
   const {
     envOrchestrator,
     executionWorkspacesSvc,
@@ -253,7 +260,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         const cwd = await materializeIsolatedTaskDirectory({
           companyId: agent.companyId,
           issueId: issueRef.id,
-          ...(input.task.freshWorkspace?.mode === "fresh_isolated_workspace" ? { attemptId: run.id } : {}),
+          ...(input.task.freshWorkspace?.mode === "fresh_isolated_workspace" ? { attemptId: run.id }
+            : reusedTaskDirectory?.attemptId ? { attemptId: reusedTaskDirectory.attemptId } : {}),
         });
         if (reusableExistingExecutionWorkspace && (
           reusableExistingExecutionWorkspace.companyId !== agent.companyId ||
@@ -391,7 +399,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const skipHostProvision = copyOnlyProvisioning || hostProvisionDriver === "sandbox" || hostProvisionDriver === "ssh";
   const hostExecutionWorkspaceConfig = isDotRun ? {} :
     stripHostWorkspaceProvision({
-      config: fresh ? { ...mergedConfig, workspaceStrategy: { type: "project_primary" } } : mergedConfig,
+      config: (fresh || reusedTaskDirectory) ? { ...mergedConfig, workspaceStrategy: { type: "project_primary" } } : mergedConfig,
       skipHostProvision,
     });
   const executionWorkspaceBase = {
