@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { dashboardService } from "../services/dashboard.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   DEFAULT_RECOVERY_RATE_THRESHOLD_PERCENT,
   MAX_WINDOW_WEEKS,
@@ -22,12 +23,16 @@ function parsePositiveNumber(
 export function dashboardRoutes(db: Db) {
   const router = Router();
   const svc = dashboardService(db);
+  const instanceSettings = instanceSettingsService(db);
   const recoveryObservability = recoveryObservabilityService(db);
 
   router.get("/companies/:companyId/dashboard", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const summary = await svc.summary(companyId);
+    const experimental = await instanceSettings.getExperimental();
+    const summary = await svc.summary(companyId, {
+      includeCopilotRequests: experimental.enableCopilotRequestDashboard === true,
+    });
     res.json(summary);
   });
 

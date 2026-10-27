@@ -167,6 +167,8 @@ export function InstanceExperimentalSettings() {
         queryClient.invalidateQueries({ queryKey: ["built-in-agents"] }),
         queryClient.invalidateQueries({ queryKey: queryKeys.health }),
         queryClient.invalidateQueries({ queryKey: ["apps"] }),
+        // The dashboard summary shape follows enableCopilotRequestDashboard.
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
       ]);
     },
     onError: (error, _patch, context) => {
@@ -228,6 +230,8 @@ export function InstanceExperimentalSettings() {
   const statusCardsBlockedByManagedSummaries = summariesManaged && !enableSummaries;
   const summariesRequiredByManagedStatusCards = statusCardsManaged && enableStatusCards;
   const enableDecisions = experimentalQuery.data?.enableDecisions === true;
+  const enableCopilotRequestDashboard =
+    experimentalQuery.data?.enableCopilotRequestDashboard === true;
   const enableGoalsSidebarLink = experimentalQuery.data?.enableGoalsSidebarLink === true;
   const enableCases = experimentalQuery.data?.enableCases === true;
   const enableServerInfoDebugView = experimentalQuery.data?.enableServerInfoDebugView === true;
@@ -388,6 +392,20 @@ export function InstanceExperimentalSettings() {
             ariaLabel="Toggle conference room chat experimental setting"
           />
         ) : null}
+
+        <ExperimentalToggleCard
+          title="Copilot Request Dashboard"
+          description="Replace the dashboard Month Spend card with a monthly count of GitHub Copilot runs, plus the premium requests they used, when the company runs GitHub Copilot agents. Copilot runs record no dollar spend."
+          footnote="Display only. Cost tracking and budgets are unchanged."
+          checked={enableCopilotRequestDashboard}
+          onCheckedChange={(checked) =>
+            toggleMutation.mutate({ enableCopilotRequestDashboard: checked })
+          }
+          disabled={toggleMutation.isPending}
+          settingKey="enableCopilotRequestDashboard"
+          managed={managedKeys.enableCopilotRequestDashboard}
+          ariaLabel="Toggle Copilot request dashboard experimental setting"
+        />
 
         <ExperimentalToggleCard
           title="Decisions"

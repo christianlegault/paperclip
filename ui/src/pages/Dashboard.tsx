@@ -16,6 +16,7 @@ import { accessApi } from "../api/access";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
+import { instanceSettingsApi } from "../api/instanceSettings";
 import { buildCompanyUserProfileMap } from "../lib/company-members";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -31,14 +32,14 @@ import { ActivityList } from "../components/ActivityList";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
-import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
+import { Bot, CircleDot, DollarSign, Plane, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { InlineBanner } from "../components/InlineBanner";
-import type { Agent, Issue } from "@paperclipai/shared";
+import type { Agent, DashboardSummary, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
 import { SmokeLabDashboardCard } from "../components/SmokeLabDashboardCard";
 
@@ -71,6 +72,24 @@ export function derivePausedAgentBanner(agents: Agent[] | undefined): PausedAgen
   }
   if (agents.every((agent) => agent.status === "paused")) return { kind: "all-paused" };
   return null;
+}
+
+/**
+ * Experimental: with `enableCopilotRequestDashboard`, a company that uses the
+ * GitHub Copilot adapter sees its monthly Copilot runs instead of dollar spend, since
+ * Copilot runs are billed as subscription requests and record $0.
+ */
+export function deriveCopilotRequestCard(
+  enabled: boolean,
+  agents: Pick<Agent, "adapterType">[] | undefined,
+  summary: Pick<DashboardSummary, "copilotRequests"> | undefined,
+): NonNullable<DashboardSummary["copilotRequests"]> | null {
+  if (!enabled) return null;
+  const copilotRequests = summary?.copilotRequests;
+  if (!copilotRequests) return null;
+  const usesCopilot = agents?.some((agent) => agent.adapterType === "copilot_local") ?? false;
+  if (!usesCopilot && copilotRequests.monthRuns === 0) return null;
+  return copilotRequests;
 }
 
 export function Dashboard() {
@@ -175,6 +194,16 @@ export function Dashboard() {
     enabled: !!selectedCompanyId,
   });
   usePublishSharedQueryData(sharedDashboard, data, dashboardUpdatedAt);
+
+  const { data: experimentalSettings } = useQuery({
+    queryKey: queryKeys.instance.experimentalSettings,
+    queryFn: () => instanceSettingsApi.getExperimental(),
+  });
+  const copilotRequestCard = deriveCopilotRequestCard(
+    experimentalSettings?.enableCopilotRequestDashboard === true,
+    agents,
+    data,
+  );
 
   const activityQueryKey = [...queryKeys.activity(selectedCompanyId!), { limit: DASHBOARD_ACTIVITY_LIMIT }] as const;
   const sharedActivity = useSharedPollingQuery({
@@ -429,20 +458,36 @@ export function Dashboard() {
                 </span>
               }
             />
-            <MetricCard
-              appearance={designSandbox ? "card" : "plain"}
-              icon={DollarSign}
-              value={formatCents(data.costs.monthSpendCents)}
-              label="Month Spend"
-              to="/costs"
-              description={
-                <span>
-                  {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
-                </span>
-              }
-            />
+            {copilotRequestCard ? (
+              <MetricCard
+                appearance={designSandbox ? "card" : "plain"}
+                icon={Plane}
+                value={copilotRequestCard.monthRuns.toLocaleString()}
+                label="Month Copilot Runs"
+                to="/costs"
+                description={
+                  <span>
+                    {copilotRequestCard.monthPremiumRequests.toLocaleString()} premium request
+                    {copilotRequestCard.monthPremiumRequests === 1 ? "" : "s"}
+                  </span>
+                }
+              />
+            ) : (
+              <MetricCard
+                appearance={designSandbox ? "card" : "plain"}
+                icon={DollarSign}
+                value={formatCents(data.costs.monthSpendCents)}
+                label="Month Spend"
+                to="/costs"
+                description={
+                  <span>
+                    {data.costs.monthBudgetCents > 0
+                      ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
+                      : "Unlimited budget"}
+                  </span>
+                }
+              />
+            )}
             <MetricCard
               appearance={designSandbox ? "card" : "plain"}
               icon={ShieldCheck}

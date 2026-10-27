@@ -81,6 +81,7 @@ describe("instance settings service", () => {
       enableDecisions: false,
       enableFastResponses: false,
       enableGoalsSidebarLink: true,
+      enableCopilotRequestDashboard: false,
       enableServerInfoDebugView: true,
       enablePaperclipDeveloperMode: true,
       enableSimplifiedEnglishInteractions: false,

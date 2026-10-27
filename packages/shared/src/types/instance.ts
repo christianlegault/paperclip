@@ -102,6 +102,12 @@ export interface InstanceExperimentalSettings {
   /** Show company connection settings and allow contextual fast-response acknowledgements. */
   enableFastResponses: boolean;
   enableGoalsSidebarLink: boolean;
+  /**
+   * Replace the dashboard Month Spend card with a monthly GitHub Copilot
+   * run count (premium requests shown as detail) when the company runs
+   * Copilot (`copilot_local`) agents. Display-only; cost accounting is unchanged.
+   */
+  enableCopilotRequestDashboard: boolean;
   enableServerInfoDebugView: boolean;
   /** Shows internal Paperclip maintainer tools and observability links. */
   enablePaperclipDeveloperMode: boolean;

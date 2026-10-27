@@ -11,6 +11,7 @@ const CLOUD_STAGING_EXPERIMENTAL_KEYS: ReadonlySet<string> = new Set([
   "enableClassicTaskInterface",
   "enableCombinedInboxTasks",
   "enableConferenceRoomChat",
+  "enableCopilotRequestDashboard",
   "enableDecisions",
   "enableEnvironments",
   "enableExperimentalFileViewer",

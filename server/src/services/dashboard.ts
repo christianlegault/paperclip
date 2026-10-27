@@ -8,6 +8,11 @@ import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 
+export interface DashboardSummaryOptions {
+  /** Gated by the `enableCopilotRequestDashboard` experimental flag. */
+  includeCopilotRequests?: boolean;
+}
+
 function formatUtcDateKey(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
@@ -27,7 +32,7 @@ function getRecentUtcDateKeys(now: Date, days: number): string[] {
 export function dashboardService(db: Db) {
   const budgets = budgetService(db);
   return {
-    summary: async (companyId: string) => {
+    summary: async (companyId: string, options: DashboardSummaryOptions = {}) => {
       // This lookup only reads the company row. Rebuild it after a transient
       // disconnect; do not replay the later summary or budget workflows.
       const company = await retryIdempotentDatabaseOperation(() => db
@@ -101,6 +106,63 @@ export function dashboardService(db: Db) {
         ));
 
       const monthSpendCents = Number(monthSpend);
+      // copilot_local reports premium requests (not dollars) in
+      // result_json.copilot; the dollar ledger records those runs at $0.
+      // The Copilot CLI reports a cumulative total for the whole session, so a
+      // resumed run counts only its increase over the highest earlier total in
+      // that session — including runs from before this month. A drop means the
+      // counter restarted, so the run's own value is used.
+      const copilotRequests = options.includeCopilotRequests
+        ? await retryIdempotentDatabaseOperation(() => db.execute(sql`
+          WITH copilot_runs AS (
+            SELECT
+              run.id,
+              run.created_at,
+              run.session_id_after,
+              CASE WHEN jsonb_typeof(run.result_json -> 'copilot' -> 'premiumRequests') = 'number'
+                THEN (run.result_json -> 'copilot' ->> 'premiumRequests')::double precision
+                ELSE NULL END AS premium_requests
+            FROM ${heartbeatRuns} AS run
+            WHERE run.company_id = ${companyId}
+              AND run.created_at <= ${now.toISOString()}::timestamptz
+              AND jsonb_typeof(run.result_json -> 'copilot') = 'object'
+          ),
+          month_sessions AS (
+            SELECT DISTINCT session_id_after
+            FROM copilot_runs
+            WHERE created_at >= ${monthStart.toISOString()}::timestamptz
+              AND session_id_after IS NOT NULL
+          ),
+          scoped_runs AS (
+            SELECT *,
+              CASE WHEN session_id_after IS NULL THEN NULL
+                ELSE max(premium_requests) OVER (
+                  PARTITION BY session_id_after ORDER BY created_at, id
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ) END AS previous_requests
+            FROM copilot_runs
+            WHERE created_at >= ${monthStart.toISOString()}::timestamptz
+              OR session_id_after IN (SELECT session_id_after FROM month_sessions)
+          )
+          SELECT
+            coalesce(sum(
+              CASE
+                WHEN premium_requests IS NULL THEN 0
+                WHEN previous_requests IS NULL OR premium_requests < previous_requests THEN premium_requests
+                ELSE premium_requests - previous_requests
+              END
+            ), 0)::double precision AS premium_requests,
+            count(*)::double precision AS runs
+          FROM scoped_runs
+          WHERE created_at >= ${monthStart.toISOString()}::timestamptz
+        `)).then((rows) => {
+          const [row] = Array.from(rows as unknown as Iterable<{ premium_requests: number | string; runs: number | string }>);
+          return {
+            monthPremiumRequests: Number(row?.premium_requests ?? 0),
+            monthRuns: Number(row?.runs ?? 0),
+          };
+        })
+        : null;
       // Per-day run breakdown. A run is "recovered" when its retry chain later
       // succeeded (recovered_runs = all ancestors of a succeeded retry), so a
       // restart-killed run whose retry succeeded is pulled out of the headline
@@ -203,6 +265,7 @@ export function dashboardService(db: Db) {
           monthBudgetCents: company.budgetMonthlyCents,
           monthUtilizationPercent: Number(utilization.toFixed(2)),
         },
+        ...(copilotRequests ? { copilotRequests } : {}),
         pendingApprovals,
         budgets: {
           activeIncidents: budgetOverview.activeIncidents.length,

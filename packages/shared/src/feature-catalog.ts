@@ -293,6 +293,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableCopilotRequestDashboard: {
+    title: "Copilot Request Dashboard",
+    description:
+      "Replace the dashboard Month Spend card with a monthly GitHub Copilot run count (plus premium requests) when the company runs GitHub Copilot agents.",
+    tier: "preference",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableSimplifiedEnglishInteractions: {
     title: "Simplified English Interactions",
     description:

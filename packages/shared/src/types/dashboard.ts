@@ -24,6 +24,13 @@ export interface DashboardRunActivityDay {
   failedByErrorCode: Record<string, number>;
 }
 
+export interface DashboardCopilotRequests {
+  /** Sum of Copilot-reported premium requests across this month's runs. */
+  monthPremiumRequests: number;
+  /** Runs this month that produced a Copilot usage report. */
+  monthRuns: number;
+}
+
 export interface DashboardSummary {
   companyId: string;
   agents: {
@@ -43,6 +50,11 @@ export interface DashboardSummary {
     monthBudgetCents: number;
     monthUtilizationPercent: number;
   };
+  /**
+   * GitHub Copilot (`copilot_local`) usage for the current UTC month. Present
+   * only while the `enableCopilotRequestDashboard` experimental flag is on.
+   */
+  copilotRequests?: DashboardCopilotRequests | null;
   pendingApprovals: number;
   budgets: {
     activeIncidents: number;

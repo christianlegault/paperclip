@@ -274,4 +274,63 @@ describeEmbeddedPostgres("dashboard service", () => {
     // process_lost kills that recovered must not leak into the failed breakdown.
     expect(bucket?.failedByErrorCode.process_lost).toBeUndefined();
   });
+
+  it("counts this month's Copilot premium requests from cumulative session totals only when requested", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const monthStart = getUtcMonthStart(new Date());
+    const inMonth = new Date(monthStart.getTime() + 1_000);
+    const lastMonth = new Date(monthStart.getTime() - 24 * 60 * 60 * 1000);
+
+    await db.insert(companies).values([
+      { id: companyId, name: "Copilot", issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` },
+      { id: otherCompanyId, name: "Other", issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` },
+    ]);
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "Pilot", role: "engineer", adapterType: "copilot_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: otherAgentId, companyId: otherCompanyId, name: "Other", role: "engineer", adapterType: "copilot_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    const run = (overrides: Partial<typeof heartbeatRuns.$inferInsert>) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      createdAt: inMonth,
+      ...overrides,
+    });
+    const copilot = (premiumRequests: number | null, sessionId: string | null, createdAt = inMonth) =>
+      run({ resultJson: { copilot: { premiumRequests } }, sessionIdAfter: sessionId, createdAt });
+    const later = (seconds: number) => new Date(inMonth.getTime() + seconds * 1_000);
+    await db.insert(heartbeatRuns).values([
+      // Session-less runs count their own report.
+      copilot(3, null),
+      { ...copilot(2.5, null), status: "failed" },
+      // The CLI reports a running session total: 45 and 60 after last month's
+      // 40 are increases of 5 and 15.
+      copilot(40, "session-a", lastMonth),
+      copilot(45, "session-a", later(1)),
+      copilot(60, "session-a", later(2)),
+      // A run without a report neither counts nor resets the session total.
+      copilot(10, "session-b", later(1)),
+      copilot(null, "session-b", later(2)),
+      copilot(25, "session-b", later(3)),
+      // A drop means the counter restarted.
+      copilot(30, "session-c", later(1)),
+      copilot(5, "session-c", later(2)),
+      run({ resultJson: { stdout: "no copilot report" } }),
+      run({ resultJson: { copilot: { premiumRequests: 7 } }, companyId: otherCompanyId, agentId: otherAgentId }),
+    ]);
+
+    const withoutFlag = await dashboardService(db).summary(companyId);
+    expect(withoutFlag.copilotRequests).toBeUndefined();
+
+    const withFlag = await dashboardService(db).summary(companyId, { includeCopilotRequests: true });
+    expect(withFlag.copilotRequests).toEqual({
+      monthPremiumRequests: 3 + 2.5 + 5 + 15 + 10 + 0 + 15 + 30 + 5,
+      monthRuns: 9,
+    });
+  });
 });
